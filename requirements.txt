@@ -1,0 +1,7 @@
+# Core dependency (optional but recommended for spectral analysis)
+numpy>=1.21.0
+
+# Required external tools (must be installed separately)
+# ffmpeg  - Audio decoding and analysis
+# sox     - Statistical analysis
+# mediainfo - Metadata extraction
