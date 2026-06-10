@@ -71,6 +71,12 @@ Extract data from external tools and parse their output:
 - `measure_phase_correlation(mid, side, sr)` → per-100ms L/R Pearson correlation
 - `detect_clipping(mid, side)` → samples at 16-bit full scale
 - `map_silence(mid, sr, duration)` → silent runs < -60 dBFS for ≥ 0.5 s
+- `_noise_floor_from_audio(mid, sr)` → fallback when astats reports nan/inf (5th pct of per-100ms RMS)
+
+**Metadata forensics**:
+- `extract_mediainfo` surfaces EVERY tag: known fields go to AudioTags, everything else into `tags.other` (philosophy: show all the data a file carries)
+- `check_bit_depth_authenticity(path, claimed, duration)` → trailing-zero analysis of a 30 s mid-track s32 decode; measures *effective* bits (16-in-24 padding leaves the bottom 8 bits dead in every sample; a bit rank must be hit by ≥0.01% of samples to count)
+- `detect_encoder_trace(tags, tech, path)` → lossy-encoder fingerprints (LAME/Fraunhofer/"320kbps"/joint stereo) inside a lossless container's metadata; display-only red flag, not scored
 
 **Important**: For formats SoX can't read (MP3, M4A, AAC, OGG, OPUS, WMA, APE), `extract_sox_stats` pipes a WAV decode from ffmpeg straight into SoX's stdin — no temp files anywhere in the pipeline.
 
@@ -157,10 +163,17 @@ Terminal output with ANSI color codes:
 - **HF Phase Entropy**: <4.0 structured; >4.5 bits with depressed cutoff = quantized phase (+10); max is log2(36)≈5.17
 - **Spectral Sparsity**: <0.05 dense; >0.30 below cutoff = codec bin-zeroing (+10)
 - **Ultrasonic Corr.**: >0.6 HF breathes with music; <0.15 + collapsed bound = injected fake noise (+15)
-- **Silence Dither Ratio**: <0.15 clean lossless silence (−50); >0.3 codec hash in silence (+50)
+- **Silence Dither Ratio**: >0.3 codec hash in silence (+50). **Asymmetric**: clean silence (<0.15) is only worth −30 and ONLY with full bandwidth + no wall evidence — lossy encoders zero out digital silence too, so clean silence must never cancel wall evidence (this exact bug let a 24/96→MP3 320→ALAC chain score 18)
 - **Void above cutoff**: band rms < −85 dBFS (FFT-extracted, cutoff+800 → Nyquist−100) = digital upscale (+20) and arms the adaptive segment-vote wall
 - **Vinyl**: random (autocorr <0.3), stable (var <5 dB) noise above cutoff = analog (−40); 5–50 clicks/min confirms (−10)
-- **Cassette score**: ≥30/80 = tape source veto (−40, disarms segment vote)
+- **Cassette score**: ≥30/80 **and R11A hiss actually found** = tape source veto (−40, disarms segment vote). A cassette without tape hiss doesn't exist; slope/flutter alone must not veto.
+- **Bit depth (Source Integrity)**: effective bits from trailing zeros — ✓ all claimed bits used · ⚠ effective ≤ claimed−8 = padded upscale · ~ in-between = bit-shifted gain / fixed-point chain
+
+### Live progress
+`_Status` renders a single thread-safe stderr line (TTY only): `⏳ [done/total] file: stage (elapsed)`. The engine reports stages via the `status` callback param of `analyse()`; `build_report` reports probe/finalize stages; `main()` calls `_Status.begin/clear`.
+
+### Detection case study (regression-test this scenario)
+24/96 FLAC → 320 kbps MP3 → 24-bit ALAC originally scored 18/GENUINE: segment vote correctly failed 7/7 (+55) but the clean-silence credit (−50) cancelled it and its early-return skipped the void check (+20). Fix: clean silence is asymmetric evidence (gated −30), no early return. Now scores 78/SUSPICIOUS. Synthetic fixture: pink noise 24/96 with a 3 s muted span → lame 320 → alac.
 
 ## Common Modifications
 

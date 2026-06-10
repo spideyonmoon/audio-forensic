@@ -10,8 +10,10 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
@@ -61,6 +63,50 @@ def _camel_case(text: str) -> str:
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
+# ---------------------------------------------------------------------------
+# Live progress (single status line on stderr; thread-safe; TTY only)
+# ---------------------------------------------------------------------------
+class _Status:
+    enabled = sys.stderr.isatty()
+    _lock = threading.Lock()
+    _active: "dict[str, tuple[str, float]]" = {}
+    _done = 0
+    _total = 0
+
+    @classmethod
+    def begin(cls, total: int) -> None:
+        cls._total, cls._done, cls._active = total, 0, {}
+
+    @classmethod
+    def update(cls, name: str, stage: str) -> None:
+        if not cls.enabled: return
+        with cls._lock:
+            started = cls._active.get(name, ("", time.perf_counter()))[1]
+            cls._active[name] = (stage, started)
+            cls._render()
+
+    @classmethod
+    def done(cls, name: str) -> None:
+        if not cls.enabled: return
+        with cls._lock:
+            cls._active.pop(name, None)
+            cls._done += 1
+            cls._render()
+
+    @classmethod
+    def clear(cls) -> None:
+        if not cls.enabled: return
+        with cls._lock:
+            sys.stderr.write("\r\x1b[2K"); sys.stderr.flush()
+
+    @classmethod
+    def _render(cls) -> None:
+        now = time.perf_counter()
+        parts = [f"{n[:24]}: {s} ({now - t0:.0f}s)" for n, (s, t0) in cls._active.items()]
+        line = f"⏳ [{cls._done}/{cls._total}] " + "  ·  ".join(parts)
+        width = shutil.get_terminal_size((120, 20)).columns - 1
+        sys.stderr.write("\r\x1b[2K" + line[:width]); sys.stderr.flush()
+
 def _tool_available(name: str) -> bool:
     checker = "where" if sys.platform == "win32" else "which"
     try: return subprocess.run([checker, name], capture_output=True, check=False).returncode == 0
@@ -74,11 +120,13 @@ class AudioTags:
     title: str = ""; album: str = ""; date: str = ""; album_artist: str = ""
     artist: str = ""; bpm: str = ""; comment_quality: str = ""; comments: str = ""
     replaygain_track_gain: str = ""; replaygain_album_gain: str = ""
+    other: dict[str, str] = field(default_factory=dict)   # every remaining mediainfo tag
 
 @dataclass
 class AudioTechnical:
     bit_rate: str = ""; channels: str = ""; precision: str = ""; sample_rate: str = ""
     sample_encoding: str = ""; duration: str = ""; duration_sec: float = 0.0
+    writing_library: str = ""; format_profile: str = ""; compression_mode: str = ""
 
 @dataclass
 class LoudnessProfile:
@@ -139,6 +187,7 @@ class AuthenticityReport:
     vinyl_rip_detected: bool = False
     side_channel_analysis: str = ""
     header_integrity: str = ""
+    encoder_trace: str = ""
 
 @dataclass
 class ForensicReport:
@@ -155,6 +204,25 @@ class ForensicReport:
 # ---------------------------------------------------------------------------
 # Tool Extractors
 # ---------------------------------------------------------------------------
+# General-track keys that are technical/duplicated elsewhere in the report — everything
+# NOT in this set (and not a known tag) flows into tags.other so no metadata is hidden.
+_MEDIAINFO_NONTAG_KEYS = {
+    "@type", "AudioCount", "VideoCount", "ImageCount", "MenuCount", "TextCount",
+    "FileExtension", "FileSize", "Duration", "OverallBitRate", "OverallBitRate_Mode",
+    "StreamSize", "IsStreamable", "FrameRate", "FrameCount", "HeaderSize", "DataSize",
+    "FooterSize", "CompleteName", "FileName", "FileNameExtension", "FolderName",
+    "File_Created_Date", "File_Created_Date_Local", "File_Modified_Date", "File_Modified_Date_Local",
+    "Audio_Format_List", "Audio_Format_WithHint_List", "Audio_Codec_List", "Audio_Language_List",
+    "Format", "Format_Profile", "Format_Version", "Cover_Data",
+}
+_KNOWN_TAG_KEYS = {
+    "Title", "Album", "Recorded_Date", "Album_Performer", "Album_Artist", "Performer",
+    "BPM", "Comment", "REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_ALBUM_GAIN",
+}
+
+def _prettify_mi_key(key: str) -> str:
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", key.replace("_", " ")).strip().title()
+
 def extract_mediainfo(filepath: Path) -> tuple[AudioTags, AudioTechnical]:
     result = _run(["mediainfo", "--Output=JSON", str(filepath)])
     if result.returncode != 0: return AudioTags(), AudioTechnical()
@@ -165,17 +233,25 @@ def extract_mediainfo(filepath: Path) -> tuple[AudioTags, AudioTechnical]:
     for track in data.get("media", {}).get("track", []):
         t = track.get("@type")
         if t == "General":
-            extra = track.get("extra", {})
-            tags.title = track.get("Title", "")
+            extra = track.get("extra", {}) or {}
+            tags.title = track.get("Title", track.get("Track", ""))
             tags.album = track.get("Album", "")
             tags.date = track.get("Recorded_Date", "")
-            tags.album_artist = track.get("Album_Artist", "")
+            tags.album_artist = track.get("Album_Performer", track.get("Album_Artist", ""))
             tags.artist = track.get("Performer", "")
             tags.bpm = track.get("BPM", "")
             tags.comments = track.get("Comment", extra.get("Comment", ""))
             tags.comment_quality = extra.get("commentQuality", "")
             tags.replaygain_track_gain = extra.get("REPLAYGAIN_TRACK_GAIN", track.get("REPLAYGAIN_TRACK_GAIN", ""))
             tags.replaygain_album_gain = extra.get("REPLAYGAIN_ALBUM_GAIN", track.get("REPLAYGAIN_ALBUM_GAIN", ""))
+            # Philosophy: surface EVERY remaining tag the file carries.
+            merged = {**track, **extra}
+            for key, val in merged.items():
+                if key in _MEDIAINFO_NONTAG_KEYS or key in _KNOWN_TAG_KEYS or key == "extra": continue
+                if not isinstance(val, str) or not val.strip(): continue
+                if key.lower().startswith("replaygain"): continue
+                if len(val) > 200: val = val[:200] + " …"
+                tags.other[_prettify_mi_key(key)] = val
         elif t == "Audio":
             bit_depth = track.get("BitDepth", "")
             fmt = track.get("Format", "").upper()
@@ -189,10 +265,28 @@ def extract_mediainfo(filepath: Path) -> tuple[AudioTags, AudioTechnical]:
             tech.precision = f"{bit_depth}-bit" if bit_depth else ""
             tech.sample_rate = track.get("SamplingRate", "")
             tech.sample_encoding = f"{bit_depth}-bit {fmt}" if bit_depth else fmt
+            tech.writing_library = track.get("Encoded_Library__String", track.get("Encoded_Library", ""))
+            tech.format_profile = track.get("Format_Profile", "")
+            tech.compression_mode = track.get("Compression_Mode", "")
             mins, secs = divmod(int(raw_dur), 60)
             tech.duration = f"{mins:02d}:{secs:02d}"
 
     return tags, tech
+
+_LOSSLESS_EXTS = {".flac", ".wav", ".alac", ".m4a", ".ape", ".wv", ".aiff", ".aif"}
+_ENCODER_SIGNATURES = ("lame", "libmp3lame", "fraunhofer", " fhg", "nero aac", "fdk-aac",
+                       "320kbps", "320 kbps", "v0 (vbr", "joint stereo", "xing")
+
+def detect_encoder_trace(tags: AudioTags, tech: AudioTechnical, filepath: Path) -> str:
+    """Lossy-encoder fingerprints left in a lossless container's metadata are a
+    transcode confession the spectrum can't even see. Display-level red flag only
+    (tags can be innocent quotes), not scored."""
+    if filepath.suffix.lower() not in _LOSSLESS_EXTS: return ""
+    hay = " ".join([tags.comments, tags.comment_quality, tech.writing_library,
+                    *tags.other.values()]).lower().replace("mp3tag", "")  # the tagger app is innocent
+    hits = sorted({sig.strip() for sig in _ENCODER_SIGNATURES if sig in hay})
+    if not hits: return ""
+    return f"⚠ Lossy encoder fingerprint in metadata: {', '.join(hits)} — tags survived a transcode"
 
 _SOX_UNSUPPORTED = {".m4a", ".mp4", ".aac", ".ogg", ".opus", ".wma", ".ape", ".mp3"}
 
@@ -271,27 +365,44 @@ def extract_loudness(filepath: Path) -> tuple[LoudnessProfile, str]:
     dr_score = f"DR{int(float(dr_match.group(1)))}" if dr_match else "N/A"
     return lp, dr_score
 
-def check_bit_depth_authenticity(filepath: Path, claimed_depth: int) -> str:
+def check_bit_depth_authenticity(filepath: Path, claimed_depth: int, duration_sec: float = 0.0) -> str:
+    """Effective-bit-depth forensics via trailing-zero analysis of raw PCM.
+
+    Decodes a 30 s window (from the middle of the track — intros/outros are often
+    quiet or faded) as 32-bit PCM and measures how many low-order bits actually
+    carry signal. A genuine 24-bit master uses all 24 (dither alone guarantees a
+    live LSB); 16-bit content zero-padded into a 24-bit container leaves the bottom
+    8 bits dead in every single sample. Robust to stray corrupt samples: a bit rank
+    must be exercised by at least 0.01% of samples to count.
+    """
     if not claimed_depth: return ""
+    if not _NUMPY_OK: return f"claimed {claimed_depth}-bit — numpy unavailable, not verified"
 
-    if claimed_depth == 24 and _NUMPY_OK:
-        try:
-            cmd = ["ffmpeg", "-i", str(filepath), "-vn", "-t", "5", "-f", "s24le", "-acodec", "pcm_s24le", "pipe:1"]
-            result = subprocess.run(cmd, capture_output=True, check=False)
+    cmd = ["ffmpeg", "-v", "error"]
+    if duration_sec > 70:
+        cmd += ["-ss", f"{max(0.0, duration_sec / 2 - 15):.2f}"]
+    cmd += ["-i", str(filepath), "-vn", "-t", "30", "-c:a", "pcm_s32le", "-f", "s32le", "pipe:1"]
+    result = subprocess.run(cmd, capture_output=True, check=False)
+    if result.returncode != 0 or len(result.stdout) < 4096:
+        return f"claimed {claimed_depth}-bit — decode failed, not verified"
 
-            raw_bytes = result.stdout
-            if raw_bytes:
-                arr = np.frombuffer(raw_bytes, dtype=np.uint8)
-                lsb_array = arr[0::3]
+    arr = np.frombuffer(result.stdout[: len(result.stdout) // 4 * 4], dtype=np.int32)
+    nz = arr[arr != 0].astype(np.int64)
+    if nz.size < 1000:
+        return f"claimed {claimed_depth}-bit — sampled window is silent, not verified"
 
-                if np.any(lsb_array != 0):
-                    return "✓ Genuine 24-bit content [Numpy Binary Scan]"
-                else:
-                    return "⚠ 16-bit content padded into 24-bit container [Numpy Binary Scan]"
-        except Exception:
-            pass
+    tz = np.log2((nz & -nz).astype(np.float64)).astype(np.int64)   # trailing zeros, exact
+    counts = np.bincount(tz, minlength=33)
+    threshold = max(10, nz.size // 10000)                           # ≥0.01% of samples
+    cum = np.cumsum(counts)
+    effective_bits = 32 - int(np.argmax(cum >= threshold))
 
-    return f"✓ Genuine {claimed_depth}-bit content"
+    if effective_bits >= claimed_depth:
+        return f"✓ Verified {claimed_depth}-bit — all {claimed_depth} bits in active use"
+    elif effective_bits <= claimed_depth - 8:
+        return f"⚠ Upscaled: {claimed_depth}-bit container but only {effective_bits} bits carry signal — padded from {effective_bits}-bit source"
+    else:
+        return f"~ {effective_bits} of {claimed_depth} bits in use — bit-shifted gain or fixed-point processing chain"
 
 # --- Byproduct metrics: computed from the SpectralEngine's decoded audio.
 #     Replaces three full ffmpeg invocations (aphasemeter, astats clipping,
@@ -328,6 +439,16 @@ def detect_clipping(mid: "np.ndarray | None", side: "np.ndarray | None") -> tupl
     if total == 0: return "0", "✓ No clipped samples"
     elif total < 10: return str(total), f"~ {total} clipped sample(s) — minor"
     else: return str(total), f"⚠ {total:,} clipped samples — audible distortion likely"
+
+def _noise_floor_from_audio(mid: "np.ndarray | None", sample_rate: int) -> str:
+    """Fallback noise floor: 5th percentile of per-100ms block RMS, in dBFS."""
+    if not _NUMPY_OK or mid is None or len(mid) < sample_rate: return ""
+    block = sample_rate // 10
+    n = len(mid) // block
+    rms = np.sqrt(np.mean(mid[: n * block].reshape(n, block).astype(np.float64) ** 2, axis=1))
+    rms = rms[rms > 0]
+    if rms.size < 5: return ""
+    return f"{20 * math.log10(float(np.percentile(rms, 5))):.2f}"
 
 def map_silence(mid: "np.ndarray | None", sample_rate: int, duration_sec: float) -> tuple[str, list[str]]:
     """Silent passages (< -60 dBFS for ≥ 0.5 s), vectorized run detection."""
@@ -850,10 +971,11 @@ class SpectralEngine:
                     score += 50
                     reasons.append(f"Codec Noise in Silence: silent passages carry {silence_ratio:.2f}× the music's ultrasonic energy — artificial dither/codec hash, not clean studio silence.")
                     return score, reasons, silence_ratio, False, 0.0
-                elif silence_ratio < 0.15:
-                    score -= 50
-                    reasons.append(f"Clean Silence Floor: silent passages are spectrally clean (ratio {silence_ratio:.2f}) — consistent with an unmolested lossless master.")
-                    return score, reasons, silence_ratio, False, 0.0
+                # NOTE: clean silence is asymmetric evidence. Lossy encoders code digital
+                # silence as zeroed frames, so transcodes ALSO have pristine silence.
+                # Only dirty silence convicts; the (small, conditional) clean credit is
+                # decided in analyse() where wall evidence is known — and we must fall
+                # through so the void/vinyl checks still run.
 
         # --- Phase 2: vinyl surface noise above the cutoff
         # Band starts 1 kHz above the detected cutoff; FFT brickwall extraction so
@@ -968,9 +1090,12 @@ class SpectralEngine:
     # Rule 11 — analogue cassette source profiler (false-positive bypass)
     # -----------------------------------------------------------------------
     def _cassette_source(self, audio: "np.ndarray", frames: "np.ndarray", bins: "np.ndarray",
-                         cutoff_hz: float, cutoff_std: float, mp3_detected: bool) -> tuple[int, list[str]]:
-        score, reasons = 0, []
-        if cutoff_hz >= 19000: return 0, reasons
+                         cutoff_hz: float, cutoff_std: float, mp3_detected: bool) -> tuple[int, list[str], bool]:
+        """Returns (score, reasons, hiss_found). The veto in analyse() additionally
+        requires hiss_found — a cassette without tape hiss does not exist, and the
+        slope/flutter rules alone must not disarm the segment vote on real transcodes."""
+        score, reasons, hiss_found = 0, [], False
+        if cutoff_hz >= 19000: return 0, reasons, False
         sr = self.sample_rate
         cap = audio[: int(60.0 * sr)].astype(np.float64)
 
@@ -983,6 +1108,7 @@ class SpectralEngine:
             autocorr = calculate_autocorrelation(noise_sig, lag=100)
             if noise_db > -55.0 and autocorr < 0.2:
                 score += 30
+                hiss_found = True
                 reasons.append(f"R11A: Tape hiss present above cutoff ({noise_db:.1f} dB, random autocorr {autocorr:.2f}).")
 
         # 11B: natural magnetic-tape roll-off slope across 12-18 kHz, read straight from
@@ -1016,7 +1142,7 @@ class SpectralEngine:
         elif cutoff_std < 30:
             score -= 10
 
-        return max(0, score), reasons
+        return max(0, score), reasons, hiss_found
 
     # -----------------------------------------------------------------------
     # Spectral sparsity & ultrasonic envelope correlation (anti-forensics)
@@ -1165,7 +1291,8 @@ class SpectralEngine:
         elif main_score >= 11: return "LIKELY_GENUINE", "✓  Consistent with genuine lossless source", caveats
         else: return "GENUINE", "✓  Strong evidence of authentic lossless source", caveats
 
-    def analyse(self, max_seconds: Optional[float] = None) -> SpectralAnalysis:
+    def analyse(self, max_seconds: Optional[float] = None, status=None) -> SpectralAnalysis:
+        st = status if status is not None else (lambda _msg: None)
         result = SpectralAnalysis()
         result.scipy_available = _SCIPY_OK
         if not _NUMPY_OK:
@@ -1175,6 +1302,7 @@ class SpectralEngine:
                   "psychoacoustic tests) disabled. pip install scipy", file=sys.stderr)
 
         # Single decode: stereo when available (mid feeds every mono detector, side feeds joint-stereo forensics)
+        st("decoding")
         audio, side = None, None
         if self.channels >= 2 and (pair := self._decode_stereo(max_seconds)) is not None:
             audio, side = pair
@@ -1185,6 +1313,7 @@ class SpectralEngine:
         if audio is None or len(audio) < self.WINDOW * 2:
             result.primary_verdict = "Could not decode audio"; result.verdict_label = "INCONCLUSIVE"; return result
 
+        st("STFT")
         frames_all, phase_hi, _ = self._compute_stft(audio)
         bins = self._freq_bins()
         if frames_all.shape[0] < 4:
@@ -1197,6 +1326,7 @@ class SpectralEngine:
         else:
             frames, phase_act = frames_all, phase_hi
 
+        st("spectral metrics")
         cutoffs_per_frame = self._cutoff_per_frame(frames, bins)
         cutoff_hz, cutoff_var = float(np.percentile(cutoffs_per_frame, 95)), float(np.var(cutoffs_per_frame))
         cutoff_std = math.sqrt(cutoff_var)
@@ -1222,6 +1352,7 @@ class SpectralEngine:
 
         if _SCIPY_OK:
             # Rule: Fakin' the Funk header integrity
+            st("header integrity")
             decoded_dur = len(audio) / self.sample_rate if max_seconds is None else 0.0
             dur_mm, br_mm, hdr_reasons = self._check_header_integrity(decoded_dur)
             result.header_duration_mismatch, result.header_bitrate_mismatch = dur_mm, br_mm
@@ -1230,15 +1361,17 @@ class SpectralEngine:
             lossy_ev.extend(hdr_reasons)
 
             # Rule: psychoacoustic artefacts (pre-echo / aliasing / MP3 subband comb)
+            st("psychoacoustic tests")
             psy_score, psy_ev, preecho, aliasing, mp3_noise = self._psychoacoustic_artifacts(audio, frames, bins, cutoff_hz, mp3_profile_match)
             result.preecho_pct, result.aliasing_corr, result.mp3_noise_pattern_detected = preecho, aliasing, mp3_noise
             main += psy_score
             lossy_ev.extend(psy_ev)
 
             # Rule 11: cassette source profiler (veto — analog tape, not codec damage)
-            cass_score, cass_ev = self._cassette_source(audio, frames, bins, cutoff_hz, cutoff_std, mp3_noise)
+            st("cassette profile")
+            cass_score, cass_ev, cass_hiss = self._cassette_source(audio, frames, bins, cutoff_hz, cutoff_std, mp3_noise)
             result.cassette_score = cass_score
-            cassette_detected = cass_score >= 30
+            cassette_detected = cass_score >= 30 and cass_hiss
             if cassette_detected:
                 main -= 40
                 natural_ev.append(f"Cassette Source Profile matched (score {cass_score}): low cutoff is analog tape physics, not a codec wall.")
@@ -1260,6 +1393,7 @@ class SpectralEngine:
             # high-cutoff encoders (LAME 320 walls at ~20.2 kHz) cannot slip past the vote.
             # Natural fades have shallow cliffs and dark analog sources leave hiss, so
             # neither can arm this.
+            st("segment voting")
             wall_hz = 16500.0
             if noise_band is not None and void_db < -85.0 and cliff_depth > 30.0:
                 wall_hz = max(wall_hz, cutoff_hz + 400.0)
@@ -1270,13 +1404,21 @@ class SpectralEngine:
                 lossy_ev.append(f"Segment Vote FAILED: {seg_walled}/{seg_total} sampled 2s clips are frequency-walled at ≤{wall_hz / 1000:.1f} kHz — consistent whole-file lossy ancestry.")
 
             # Rule: silence dither / vinyl noise / clicks (3-phase)
-            if cutoff_hz <= 21500 and not cassette_detected:
+            if not cassette_detected:
+                st("silence & vinyl analysis")
                 sil_score, sil_ev, sil_ratio, vinyl_detected, clicks = self._silence_and_vinyl(audio, cutoff_hz, noise_band=noise_band)
                 result.silence_ratio, result.vinyl_noise_detected, result.vinyl_clicks_per_min = sil_ratio, vinyl_detected, clicks
                 main += sil_score
                 (lossy_ev if sil_score > 0 else natural_ev).extend(sil_ev)
+                # Clean silence is weak, asymmetric evidence (lossy encoders zero out
+                # silence too) — credit it only when the spectrum is full-bandwidth and
+                # no wall evidence exists, and keep it small.
+                if 0 <= sil_ratio < 0.15 and not seg_fail and wall_hz <= 16500.0 and cutoff_hz > self.nyquist * 0.85:
+                    main -= 30
+                    natural_ev.append(f"Clean Silence Floor: silent passages are spectrally clean (ratio {sil_ratio:.2f}) in a full-bandwidth spectrum — consistent with an unmolested lossless master.")
 
             # Rule: auCDtect statistical bound frequency & high-band phase entropy
+            st("auCDtect statistics")
             auc_avg, auc_prob, auc_phase = self._aucdtect_features(frames, phase_act, bins)
             result.auc_avg_bound_freq, result.auc_prob_bound_freq, result.auc_phase_entropy = auc_avg, auc_prob, auc_phase
             if self.sample_rate >= 40000 and 0 < auc_avg < 16500 and not cassette_detected and not vinyl_detected:
@@ -1332,6 +1474,8 @@ class SpectralEngine:
 # ---------------------------------------------------------------------------
 def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicReport:
     t_start = time.perf_counter()
+    name = filepath.name
+    _Status.update(name, "probing metadata")
     tags, tech = extract_mediainfo(filepath)
 
     try:
@@ -1358,12 +1502,14 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
         f_loud = pool.submit(extract_loudness, filepath)
         f_sox = pool.submit(extract_sox_stats, filepath)
         f_spec = pool.submit(generate_spectrogram, filepath)
-        f_bits = pool.submit(check_bit_depth_authenticity, filepath, claimed_depth)
-        spectral = engine.analyse(max_seconds=fast_secs)
+        f_bits = pool.submit(check_bit_depth_authenticity, filepath, claimed_depth, tech.duration_sec)
+        spectral = engine.analyse(max_seconds=fast_secs, status=lambda s: _Status.update(name, s))
+        _Status.update(name, "waiting on loudness/spectrogram")
         lp, dr = f_loud.result()
         sox = f_sox.result()
         spec_path = f_spec.result()
         bit_auth = f_bits.result()
+    _Status.update(name, "finalizing")
 
     auth = AuthenticityReport()
     auth.spectral = spectral
@@ -1380,15 +1526,21 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
     elif spectral.scipy_available and spectral.verdict_label != "INCONCLUSIVE":
         auth.header_integrity = "✓ Container header matches decoded stream"
     auth.bit_depth_authentic = bit_auth
+    auth.encoder_trace = detect_encoder_trace(tags, tech, filepath)
     # Byproducts of the engine's decode — no extra ffmpeg processes
     auth.phase_correlation, auth.phase_verdict = measure_phase_correlation(engine.audio_mid, engine.audio_side, sample_rate)
     auth.clipped_samples, auth.clipping_verdict = detect_clipping(engine.audio_mid, engine.audio_side)
     auth.silence_total_pct, auth.silence_sections = map_silence(engine.audio_mid, sample_rate, tech.duration_sec)
     auth.rg_stored, auth.rg_measured_lufs, auth.rg_delta, auth.rg_verdict = audit_replaygain(tags, lp.lufs_integrated)
+    if not lp.noise_floor_db:
+        # astats reports nan/inf noise floor on some content — measure it ourselves:
+        # 5th percentile of per-100ms RMS across the decoded track.
+        lp.noise_floor_db = _noise_floor_from_audio(engine.audio_mid, sample_rate)
     engine.audio_mid = engine.audio_side = None  # release decode buffers
 
     report = ForensicReport(filepath=filepath, tags=tags, technical=tech, sox_stats=sox, loudness=lp, authenticity=auth, dr_score=dr, spectrogram_path=spec_path)
     report.analysis_seconds = time.perf_counter() - t_start
+    _Status.done(name)
     return report
 
 def build_info_report(filepath: Path) -> ForensicReport:
@@ -1573,10 +1725,19 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     for row in [_kv("Duration", tec.duration), _kv("BPM", t.bpm), _kv("File Size", f"{sz:.1f} MB")]:
         if row: print(row)
     print(_section("TAGS"))
-    for row in [_kv("Title", t.title), _kv("Artist", t.artist), _kv("Album", t.album), _kv("Album Artist", t.album_artist), _kv("Year", t.date), _kv("Comment", t.comments), _kv("Rip Quality", t.comment_quality)]:
-        if row: print(row)
+    known_rows = [_kv("Title", t.title), _kv("Artist", t.artist), _kv("Album", t.album), _kv("Album Artist", t.album_artist), _kv("Year", t.date), _kv("BPM", t.bpm), _kv("Comment", t.comments), _kv("Rip Quality", t.comment_quality)]
+    printed_any = False
+    for row in known_rows:
+        if row: print(row); printed_any = True
+    if t.other:
+        for key in sorted(t.other):
+            val = t.other[key]
+            if len(val) > 70: val = val[:70] + "…"
+            print(_kv(key[:25], val)); printed_any = True
+    if not printed_any:
+        print(f"  {_c(C.GREY, 'No tags found')}")
     print(_section("TECHNICAL"))
-    for row in [_kv("Encoding", tec.sample_encoding), _kv("Bit Rate", tec.bit_rate), _kv("Sample Rate", _hz_label(tec.sample_rate)), _kv("Channels", _channel_label(tec.channels)), _kv("Precision", tec.precision)]:
+    for row in [_kv("Encoding", tec.sample_encoding), _kv("Format Profile", tec.format_profile), _kv("Bit Rate", tec.bit_rate), _kv("Sample Rate", _hz_label(tec.sample_rate)), _kv("Channels", _channel_label(tec.channels)), _kv("Precision", tec.precision), _kv("Compression", tec.compression_mode), _kv("Writing Library", tec.writing_library)]:
         if row: print(row)
     print(_section("DYNAMIC RANGE & LOUDNESS"))
     for line in _headroom_bar(lp.noise_floor_db, lp.rms_db, lp.peak_db): print(line)
@@ -1675,7 +1836,8 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     source_flags = []
     if auth.cassette_rip_detected: source_flags.append("cassette tape")
     if auth.vinyl_rip_detected: source_flags.append("vinyl")
-    for row in [_kv("Bit-Depth Auth", auth.bit_depth_authentic), _kv("Header Integrity", auth.header_integrity), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
+    bd_col = C.RED if auth.bit_depth_authentic.startswith("⚠") else (C.GREEN if auth.bit_depth_authentic.startswith("✓") else C.WHITE)
+    for row in [_kv("Bit-Depth Auth", _c(bd_col, auth.bit_depth_authentic)), _kv("Header Integrity", auth.header_integrity), _kv("Encoder Trace", _c(C.RED, auth.encoder_trace) if auth.encoder_trace else ""), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
         if row: print(row)
     if auth.silence_sections:
         for s in auth.silence_sections[:4]: print(f"    {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")
@@ -1784,11 +1946,13 @@ def main() -> None:
 
     fast = 60.0 if args.fast else None
     workers = args.workers if args.workers > 0 else min(3, os.cpu_count() or 1)
+    _Status.begin(len(paths))
     if len(paths) > 1 and workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             reports = list(pool.map(lambda p: build_report(p, fast_secs=fast), paths))
     else:
         reports = [build_report(p, fast_secs=fast) for p in paths]
+    _Status.clear()
     if args.json:
         print(json.dumps([_report_to_dict(r) for r in reports], indent=2, default=str))
         return

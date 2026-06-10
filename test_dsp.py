@@ -165,11 +165,12 @@ check("independent injected HF -> corr ~ 0", abs(c_fake) < 0.3, f"{c_fake:.2f}")
 
 # ---------------------------------------------------------------------------
 print("\n== 11. Silence / dither / vinyl analyser ==")
-# Case A: clean silence inside genuine music -> strong lossless credit (-50)
+# Case A: clean silence inside genuine music -> measured clean, NO credit from the
+# function itself (lossy encoders zero silence too; the conditional credit lives in analyse())
 music = noise(45.0, amp=0.3)
 music[5 * SR:8 * SR] = 0.0
 s, rs, ratio, v, _ = eng._silence_and_vinyl(music, 22000)
-check("clean digital silence -> -50 credit", s == -50 and ratio >= 0 and ratio < 0.15, f"score {s}, ratio {ratio:.3f}")
+check("clean digital silence -> measured, no auto-credit", s == 0 and 0 <= ratio < 0.15, f"score {s}, ratio {ratio:.3f}")
 
 # Case B: codec hash in silence (HF noise present in 'silent' passage) -> +50 penalty
 music_lp = brickwall(noise(45.0, amp=0.3), 15000)   # music has ~no 16k+ energy
@@ -193,12 +194,12 @@ check("digital void above cutoff -> +20 penalty", s4 == 20 and not v4, f"score {
 print("\n== 12. Cassette source profiler (Rule 11) ==")
 tape = brickwall(noise(60.0, amp=0.3), 14000) + noise(60.0, amp=0.01)  # music + audible hiss
 tape_frames, _, _ = eng._compute_stft(tape)
-cs, cev = eng._cassette_source(tape, tape_frames, bins, 14000.0, 150.0, mp3_detected=False)
-check("tape hiss + flutter -> cassette score >= 30", cs >= 30, f"score {cs}: {len(cev)} rules hit")
+cs, cev, hiss = eng._cassette_source(tape, tape_frames, bins, 14000.0, 150.0, mp3_detected=False)
+check("tape hiss + flutter -> cassette score >= 30 with hiss", cs >= 30 and hiss, f"score {cs}: {len(cev)} rules hit")
 sterile = brickwall(noise(60.0, amp=0.3), 14000)
 sterile_frames, _, _ = eng._compute_stft(sterile)
-cs_clean, _ = eng._cassette_source(sterile, sterile_frames, bins, 14000.0, 5.0, mp3_detected=True)
-check("sterile walled file -> low cassette score", cs_clean < 30, f"score {cs_clean}")
+cs_clean, _, hiss_clean = eng._cassette_source(sterile, sterile_frames, bins, 14000.0, 5.0, mp3_detected=True)
+check("sterile walled file -> no hiss, no veto", (cs_clean < 30 or not hiss_clean), f"score {cs_clean}, hiss {hiss_clean}")
 
 # ---------------------------------------------------------------------------
 print("\n== 13. Psychoacoustic artefacts (smoke + sanity) ==")
