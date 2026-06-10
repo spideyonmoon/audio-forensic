@@ -1,299 +1,145 @@
-# Audio Forensics CLI
-> Author Note: AI wrote this. Don't have the time at this moment for Readmes. Soon.
-
----
-
----
+# Audio Forensic
 
 <div align="center">
- 
+
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Audio](https://img.shields.io/badge/Audio-Forensics-red.svg)
 
-**Professional audio forensics analysis with calibrated thresholds for real-world mastered audio.**
+**State-of-the-art lossless-authenticity forensics for real-world music.**
+
+Detects fake lossless files (lossy transcodes hiding in FLAC/ALAC/WAV containers)
+with an 11-rule DSP forensic engine, measured codec fingerprints, and a unified
+0–100 Main Score — calibrated so genuine mastered audio never gets falsely flagged.
 
 </div>
 
 ---
 
-## What is Audio Forensic?
+## What it does
 
-A command-line audio forensics tool that analyzes audio files to determine their authenticity, quality, and technical characteristics. It combines multiple audio analysis engines (ffmpeg, SoX, mediainfo) with a custom numpy-based spectral analysis engine to provide comprehensive forensic insights.
+You hand it audio files. It tells you, with evidence, whether they are what they
+claim to be:
 
-Unlike generic audio analysis tools, Audio Forensic was built with **real-world mastered audio in mind** — not synthetic test signals.
+- **Transcode detection** — was this FLAC once an MP3, AAC, Opus, or Vorbis file?
+- **Codec fingerprinting** — *which* encoder and bitrate left the wall (measured
+  LAME/AAC/Vorbis lowpass frequencies, Opus' CELT 20 kHz band limit)
+- **Spliced/partial transcode detection** — which time regions are walled, reported as timestamps
+- **Bit-depth authenticity** — 24-bit container, but do all 24 bits carry signal?
+- **Header forensics** — forged duration/bitrate headers ("Fakin' the Funk" checks)
+- **Analog source profiling** — vinyl surface noise and cassette tape signatures are
+  recognized and *excused*, not flagged
+- **Full loudness/dynamics report** — LUFS, DR, true peak, crest factor, streaming
+  normalization deltas, ReplayGain audit, phase correlation, clipping, silence map
+- **Spectrogram** — SoX-rendered PNG next to every analyzed file
 
----
-
-## The Problem with Other Tools
-
-Most audio forensics tools are calibrated against:
-- Clean sine waves
-- White/pink noise
-- Synthetic test signals
-
-This causes **massive false positives** when analyzing actual music:
-
-| Metric | Generic Tool Says | Reality |
-|--------|------------------|---------|
-| DR5 | "BAD" (red) | Normal for modern pop/rock |
-| Crest Factor 3dB | "BAD" (red) | Typical for compressed audio |
-| SoX Entropy 0.09 | "Suspicious" (red) | Normal for tonal music |
-| HF cutoff 19.8kHz | "Lossy!" (red) | Standard CD mastering |
-| Peak at 0.999 | "Clipping!" (red) | Normal loudness normalization |
-
-af2 fixes all of this.
-
----
-
-## Features
-
-### Comprehensive Analysis
-- **Technical Metadata**: Bit depth, sample rate, channels, encoding
-- **Loudness Profiling**: LUFS, DR, crest factor, EBU R128
-- **Spectral Analysis**: FFT-based authenticity detection
-- **Dynamic Range**: True peak, RMS, noise floor
-- **Phase Correlation**: Stereo width and compatibility
-- **ReplayGain Audit**: Tag verification
-
-### Intelligent Thresholds
-- Calibrated for commercially mastered audio
-- Context-aware color coding
-- Human-readable interpretations for every metric
-- No false positives from normal mastering practices
-
-### Professional Output
-- Clean ANSI terminal output
-- JSON export for automation
-- Batch mode for album analysis
-- Spectrogram generation
-
----
-
-## Installation
-
-### Requirements
+## Quick start
 
 ```bash
-# Core dependencies (must be in PATH)
-ffmpeg    # Audio decoding and analysis
-sox       # Statistical analysis
-mediainfo # Metadata extraction
+# Requirements in PATH: ffmpeg, sox, mediainfo
+pip install -r requirements.txt   # numpy + scipy
 
-# Python dependencies
-numpy     # Spectral analysis
+python audio_forensic.py "track.flac"          # full forensic report
+python audio_forensic.py *.flac                # batch an album (live ETA, summary table)
+python audio_forensic.py track.flac --json     # machine-readable output
+python audio_forensic.py track.flac --fast     # first 60 s only
+python audio_forensic.py track.flac --info     # metadata only, no DSP
+python audio_forensic.py *.flac --workers 4    # batch concurrency (default: auto, ≤3)
 ```
 
-### Install on macOS
+A 4-minute FLAC analyzes in ~3–5 s. A live status line shows the current stage,
+a progress bar, and a self-calibrating ETA.
+
+## The Main Score (0–100)
+
+Every detector feeds one number. 0 = pristine lossless, 100 = certain transcode.
+
+| Score | Verdict | Meaning |
+|-------|---------|---------|
+| 0–10 | **GENUINE** | Strong evidence of authentic lossless source |
+| 11–30 | **LIKELY_GENUINE** | Consistent with genuine lossless |
+| 31–54 | **CAUTION** | Minor spectral quirks — possibly legitimate |
+| 55–85 | **SUSPICIOUS** | Strong lossy indicators — probable transcode |
+| 86–100 | **LIKELY_LOSSY** | Fake lossless, high certainty |
+
+## Measured detection performance
+
+Synthetic pink-noise fixtures, encode → decode → FLAC/ALAC (i.e. fake lossless), at
+both 44.1 and 48 kHz:
+
+| Source | Result |
+|--------|--------|
+| MP3 64–320 kbps | **88–100 LIKELY_LOSSY** (all bitrates, both sample rates) |
+| AAC 96–192 kbps | **88–100 LIKELY_LOSSY** |
+| Opus 64–192 kbps | **88 LIKELY_LOSSY** (every bitrate — CELT 20 kHz fingerprint) |
+| Vorbis q2–q4 | **91–100 LIKELY_LOSSY** |
+| 24/96 master → MP3 320 → 24-bit ALAC | **88 LIKELY_LOSSY** |
+| Half-genuine / half-MP3 splice | **45 CAUTION** + walled regions listed with timestamps |
+| Genuine / dark master / vinyl / cassette / mono controls | **0 GENUINE** (zero false positives) |
+
+Known limits: AAC ≥256 kbps and Vorbis q6+ encode pink noise at full bandwidth and
+are spectrally invisible on synthetic fixtures — real music leaves more artifacts,
+but treat "transparent-bitrate AAC" as detectable only sometimes.
+
+## How it works — the forensic suite
+
+One ffmpeg decode and one cached STFT feed every detector. Highlights:
+
+- **Segment voting (9 clips)** — 2 s clips spread across the file, each checked for a
+  frequency wall; majority = whole-file lossy ancestry (+55). The wall threshold is
+  *adaptive*: a >30 dB cliff backed by a verified digital void (or a codec-fingerprint
+  match) moves the wall up to the cutoff, which is what catches 320 kbps walls at 20.5 kHz.
+- **Codec wall fingerprints** — the cutoff is compared against *measured* encoder
+  lowpass tables (LAME per bitrate at 44.1 **and** 48 kHz, ffmpeg-AAC, Vorbis, Opus'
+  bitrate-independent 20.46 kHz CELT limit). Published spec tables are wrong; these
+  were measured from real encodes. A hit gated on void/cliff evidence adds +10 and
+  names the encoder in the report.
+- **Spliced/partial detection** — per-clip cutoffs + per-clip cliff depth; ≥2 walled
+  clips in an otherwise full-band file report exact mm:ss regions (+30–55 by coverage
+  and fingerprint).
+- **auCDtect-style bound frequency** — spectral scatter collapse exposes the
+  statistical void a codec leaves even when noise is pasted on top.
+- **Silence dither analysis** — codec hash inside "silent" passages (+50). Asymmetric
+  by design: clean silence is only weak evidence, because lossy encoders zero out
+  silence too.
+- **Psychoacoustic artifacts** — pre-echo (MDCT smearing), filterbank aliasing
+  correlation, the MP3 32-band 689 Hz subband comb.
+- **Anti-forensics exposure** — fake ultrasonic noise injected above a codec wall is
+  caught by envelope-correlation + scatter-collapse cross-checks.
+- **Analog vetoes** — vinyl (random, stable hiss + click transients) and cassette
+  (tape hiss + natural slope + wow/flutter) subtract evidence instead of adding it;
+  a real tape rip with a 14 kHz ceiling is *not* a transcode.
+- **Source integrity** — effective-bit-depth probe (16-in-24 padding detection),
+  header duration/bitrate plausibility, lossy-encoder fingerprints left in tags.
+
+Every fired rule prints a human-readable evidence line, so the verdict is auditable.
+
+## Calibrated for real music
+
+Generic tools flag normal mastering as suspicious. This one does not:
+
+| Trait | Generic tool | Audio Forensic |
+|-------|--------------|----------------|
+| DR5, crest 3 dB | "BAD" | Normal modern mastering |
+| Peak at 0.999 | "Clipping!" | Normal limiting |
+| 19–20 kHz mastering LPF | "Lossy!" | Legitimate unless a *measured codec wall* + void backs it |
+| Vinyl/tape HF rolloff | "Lossy!" | Analog signature → evidence subtracted |
+| Dark/quiet masters | "Suspicious" | 0 on the control fixtures |
+
+## Output
+
+Full ANSI-colored terminal report: identity/tags (every tag the file carries),
+technical specs, loudness graph + EBU R128 + streaming deltas, dynamics, the
+forensic verdict with evidence lists, SoX acoustic measurements, and per-file
+timing. `--json` emits the entire structure for scripting. Batch mode adds an
+album summary table with DR/LUFS/score per track and DR-outlier warnings.
+
+## Verification
 
 ```bash
-brew install ffmpeg sox mediainfo
-pip3 install numpy
+python test_dsp.py   # 42 self-contained synthetic-signal checks, no audio files needed
 ```
-
-### Install on Ubuntu/Debian
-
-```bash
-sudo apt install ffmpeg sox mediainfo
-pip3 install numpy
-```
-
-### Install on Windows
-
-Download and install:
-- [ffmpeg](https://ffmpeg.org/download.html)
-- [SoX](https://sox.sourceforge.net/)
-- [MediaInfo](https://mediaarea.net/en/MediaInfo)
-
-Then:
-```bash
-pip install numpy
-```
-
----
-
-## Quick Start
-
-### Analyze a single file
-
-```bash
-python af2.py "path/to/audio.flac"
-```
-
-### Batch analyze an album
-
-```bash
-python af2.py *.flac
-```
-
-### JSON output (for scripts)
-
-```bash
-python af2.py "track.flac" --json
-```
-
-### Fast mode (first 60 seconds)
-
-```bash
-python af2.py "track.flac" --fast
-```
-
-### Lightweight info only
-
-```bash
-python af2.py "track.flac" --info
-```
-
----
-
-## Output Explained
-
-```
-── DYNAMIC RANGE & LOUDNESS ────────────────────────────────
-
-  DR Score (EBU)        DR5 — normal for modern mastered audio
-  Crest Factor          2.94 dB — compressed (modern standard)
-  SoX Entropy           0.09 — very low (highly tonal/structured)
-
-── AUTHENTICITY & FORENSICS ───────────────────────────────
-
-  ████░░░░░░ ✓ Strong evidence of authentic lossless source
-  Score: Lossy 2 − Natural 6 = Net 0
-
-  Lossy indicators
-    · None detected
-
-  Natural indicators
-    · Gradual spectral rolloff (natural EQ / mastering)
-    · High cutoff variance (organic/analog source)
-    · Natural HF noise above cutoff
-    · Healthy stereo image
-    · High spectral complexity
-
-  Context notes
-    · Modern mastering often uses gentle HF limiting at 19-20 kHz
-```
-
----
-
-## Metric Reference
-
-### Dynamic Quality
-
-| Metric | What it means | Normal range |
-|--------|---------------|--------------|
-| **DR Score** | Dynamic Range (higher = more dynamic) | DR5-12 for modern music |
-| **Crest Factor** | Peak-to-RMS ratio | 3-15 dB depending on genre |
-| **SoX Entropy** | Time-domain signal randomness | 0.0-0.3 for music |
-
-### Spectral Analysis
-
-| Metric | What it means | Suspicious if |
-|--------|---------------|---------------|
-| **HF Cutoff** | Highest frequency with content | <18 kHz |
-| **Cliff Sharpness** | How abrupt the rolloff is | >15 dB/bin |
-| **HF Energy Ratio** | Energy above 15kHz | <0.005 |
-| **Noise Floor** | Content above cutoff | <-70 dB (silent void) |
-| **Banding Score** | Quantization artifacts | >0.92 with low cutoff |
-
-### Verdict Labels
-
-| Label | Meaning |
-|-------|---------|
-| **GENUINE** | Strong evidence of authentic lossless |
-| **LIKELY_GENUINE** | Consistent with lossless source |
-| **CAUTION** | Minor quirks, likely legitimate |
-| **SUSPICIOUS** | Spectral anomalies detected |
-
----
-
-## Comparison: af2 vs af.py
-
-af2 is a complete rewrite with calibrated thresholds for real audio:
-
-| Feature | af.py | af2.py |
-|---------|-------|--------|
-| DR5 coloring | RED (wrong) | WHITE (correct) |
-| Crest Factor coloring | RED (wrong) | WHITE (correct) |
-| SoX Entropy interpretation | "Suspicious" | "Typical music" |
-| Peak at 0.999 coloring | RED (wrong) | YELLOW (correct) |
-| HF cutoff threshold | 97% Nyquist | 85% Nyquist |
-| HF energy threshold | <0.02 suspicious | <0.005 suspicious |
-| Metric explanations | "low=..., high=..." | "moderate variation (natural)" |
-| Verdict accuracy | Many false positives | Calibrated for mastered audio |
-
----
-
-## Real-World Test Results
-
-### Commercial Pop Album
-
-```
-Track 1.flac   DR5  -14.8 LUFS  ✓ GENUINE
-Track 2.flac   DR6  -14.2 LUFS  ✓ GENUINE
-Track 3.flac   DR4  -15.1 LUFS  ✓ GENUINE
-```
-
-af2 correctly identifies all tracks as genuine, while af.py flagged them as "WARNING" due to incorrect threshold calibration.
-
-### Lossy Transcode Detection
-
-```
-Source: FLAC 16/44.1 → MP3 128kbps → FLAC 16/44.1
-
-af.py:  WARNING (Net 4/17)
-af2.py: SUSPICIOUS (Net 7) ✓ Correct
-```
-
-af2 correctly identifies the lossy source using calibrated HF and banding thresholds.
-
----
-
-## Philosophy
-
-### What af2 believes
-
-- **DR5 is not bad** — it's normal for music released after 1990
-- **Peaks at 0.999 are not clipping** — they're normal mastering
-- **HF rolloff at 20kHz is not suspicious** — it's standard CD mastering
-- **Low entropy is not transcode evidence** — it's normal for tonal music
-
-### What af2 flags as suspicious
-
-- True digital overs (>1.0 sample values)
-- Silent voids above cutoff (not purple noise)
-- Hard spectral cliffs (>15 dB/bin)
-- Extremely stable cutoffs with very low HF
-- Joint stereo artifacts in side channel
-
----
-
-## Contributing
-
-Issues and pull requests welcome! If you find a file that af2 misclassifies, please open an issue with:
-1. The file's characteristics (genre, year, label)
-2. The af2 output
-3. Any known history of the file
-
----
 
 ## License
 
-MIT License — do whatever you want with it.
-
----
-
-## Acknowledgments
-
-- SoX team for the original stat tool
-- ffmpeg team for audio processing
-- MediaArea for metadata extraction
-- The audio forensics community for threshold research
-
----
-
-<div align="center">
-
-**Made with Python, numpy, and too much listening to compressed music.**
-
-</div>
+MIT — do whatever you want with it.

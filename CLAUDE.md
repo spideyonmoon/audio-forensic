@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Audio Forensic** is a command-line tool for comprehensive audio authenticity analysis. Unlike generic audio tools that falsely flag normal mastered audio, this tool uses calibrated thresholds specifically tuned for real-world commercially mastered audio.
 
 - **Language**: Python 3.8+
-- **Main file**: `audio_forensic.py` (~1,550 lines)
+- **Main file**: `audio_forensic.py` (~1,900 lines)
 - **Entry point**: `main()` function using argparse for CLI
 - **Key dependencies**: numpy (base spectral engine), scipy (advanced forensic suite — degrades gracefully if missing), plus external tools (ffmpeg, sox, mediainfo)
 - **Tests**: `test_dsp.py` — self-contained synthetic-signal verification of every DSP metric (`python test_dsp.py`, no audio files/tools needed)
@@ -87,8 +87,9 @@ Core authenticity verdict engine. One stereo decode feeds everything (mid `(L+R)
 - `WINDOW = 4096; HOP = 2048` — FFT frame size and stride
 - `CUTOFF_DB = -65.0` — Energy threshold for detecting spectral rolloff
 - `NYQUIST_MARGIN = 0.85` — Cutoff must be below 85% of Nyquist to be suspicious
-- `TIME_DOMAIN_CAP_S = 180` — Hilbert/filterbank analyses capped to bound CPU/RAM
-- `MP3_CUTOFFS` — empirically measured LAME lowpass cutoffs per bitrate (-65 dB point)
+- `TIME_DOMAIN_CAP_S = 180` — envelope/filterbank analyses capped to bound CPU/RAM
+- `MP3_CUTOFFS` — empirically measured LAME lowpass cutoffs per bitrate (-65 dB point); still used for MP3-comb gating
+- `CODEC_WALLS` — measured codec lowpass walls as `(codec, profile, hz, tol)` tuples covering LAME (44.1k AND 48k — walls shift with sample rate), ffmpeg-AAC, Vorbis, and Opus' bitrate-independent CELT 20,460 Hz limit. Measured via `testdata/make_fixtures.py` + `testdata/measure.py`; NEVER replace with published spec values (they're wrong). `_codec_fingerprint(cutoff_hz)` returns the nearest in-tolerance entry (None at ≥98% Nyquist).
 
 **Base scoring** (legacy evidence engine, feeds 45 of the 100 main-score points):
 - `SCORE_*` / `NATURAL_*` constants, `MAX_LOSSY_SCORE = 14`
@@ -101,7 +102,9 @@ Core authenticity verdict engine. One stereo decode feeds everything (mid `(L+R)
 
 **Advanced forensic suite** (scipy; each method returns score deltas + evidence strings):
 - `_check_header_integrity()` — Fakin' the Funk: container duration vs decoded sample count (free — uses the existing decode), bitrate-vs-filesize plausibility for lossy containers
-- `_segment_voting()` — AFD PRO: 7 spread 2s clips wall-checked, majority vote (+55). Wall threshold is **adaptive**: a >30 dB cliff with a verified digital void above it moves the wall from 16.5 kHz to cutoff+400, which is what catches 192–320 kbps transcodes
+- `_segment_voting()` — AFD PRO: 9 spread 2s clips wall-checked, majority vote (+55); returns per-clip `(offset_s, cutoff_hz, cliff_db)` and skips silent clips (their cutoff reads 0 and would poison the vote). Wall threshold is **adaptive**: a >30 dB cliff with a verified digital void above it **or a codec-fingerprint match** moves the wall from 16.5 kHz to cutoff+400. The fingerprint path matters: AAC's own residue above its cutoff defeats the void check (e.g. AAC 192 @48k scored 36 until fingerprint-arming pushed it to 100)
+- **Partial/spliced transcode rule** (in `analyse()`, `elif` of the majority vote): ≥2 non-majority clips with cutoff < min(global−2k, 0.85·Nyquist) AND per-clip cliff >25 dB → +30 (+40 if ≥4 clips, +15 more if their median cutoff fingerprints) with mm:ss regions in `result.segment_map`, rendered under the Segment Vote row
+- **Codec wall fingerprint rule** — `_codec_fingerprint(cutoff_hz)` hit gated on (void verified OR cliff >30 dB) and no analog veto → +10, names encoder+bitrate in evidence. This is what lifts high-bitrate walls (MP3 192–320, Opus, Vorbis q4) from 78/SUSPICIOUS to 88+/LIKELY_LOSSY while arbitrary mastering LPFs (not on a measured frequency) stay clear
 - `_aucdtect_features()` — bound frequency via spectral scatter collapse (5-bin sliding std of log power; bins <-110 dB rel clamped so decoder residue reads as void) + high-band phase-difference entropy (>4.5 bits with depressed cutoff = quantized HF phase). Note: the bound check is defeated by 16-bit re-quantization noise on 16-bit fakes — the void/wall detectors cover those; auCDtect covers float/24-bit fakes
 - `_silence_and_vinyl()` — 3-phase: dither ratio inside silent passages (±50), digital-void-above-cutoff (+20), vinyl surface noise (random autocorr + stable energy, −40) and click counting (−10)
 - `_psychoacoustic_artifacts()` — pre-echo (HF energy before transients), HF filterbank aliasing correlation, MP3 32-band subband comb (spectral autocorrelation at 689 Hz multiples)
@@ -115,7 +118,7 @@ Core authenticity verdict engine. One stereo decode feeds everything (mid `(L+R)
 
 **Verdict labels**: GENUINE, LIKELY_GENUINE, CAUTION, SUSPICIOUS, LIKELY_LOSSY, INCONCLUSIVE
 
-**Measured detection performance** (synthetic pink-noise fixtures, MP3→FLAC transcodes): 64–160 kbps → 100/100 LIKELY_LOSSY; 192–320 kbps → 78 SUSPICIOUS; genuine/vinyl-sim/dark-master/mono stay ≤20.
+**Measured detection performance** (synthetic pink-noise fixtures, encode→FLAC/ALAC, 44.1k and 48k): MP3 64–320 kbps → 88–100 LIKELY_LOSSY; AAC 96–192 → 88–100; Opus 64–192 → 88 (CELT fingerprint); Vorbis q2–q4 → 91–100; 24/96→MP3 320→ALAC case study → 88; half-spliced → 45 CAUTION with regions; genuine/vinyl-sim/dark-master/cassette-sim/mono all 0. **Known misses**: AAC ≥256 kbps and Vorbis q6+ keep full bandwidth on pink noise (no wall to detect) — real-music artifacts are the only path there.
 
 #### 3. **Report Generation** (`build_report()` / `build_info_report()`)
 - `build_report()` → Full forensic analysis. Subprocess-bound extractors (loudness graph, SoX stats, spectrogram, bit-depth probe) run in a ThreadPoolExecutor while the SpectralEngine crunches on the main thread; byproduct metrics reuse the engine's decode. Wall time ≈ max(engine, loudness) instead of the sum of everything (~6× faster).
@@ -169,8 +172,8 @@ Terminal output with ANSI color codes:
 - **Cassette score**: ≥30/80 **and R11A hiss actually found** = tape source veto (−40, disarms segment vote). A cassette without tape hiss doesn't exist; slope/flutter alone must not veto.
 - **Bit depth (Source Integrity)**: effective bits from trailing zeros — ✓ all claimed bits used · ⚠ effective ≤ claimed−8 = padded upscale · ~ in-between = bit-shifted gain / fixed-point chain
 
-### Live progress
-`_Status` renders a single thread-safe stderr line (TTY only): `⏳ [done/total] file: stage (elapsed)`. The engine reports stages via the `status` callback param of `analyse()`; `build_report` reports probe/finalize stages; `main()` calls `_Status.begin/clear`.
+### Live progress & ETA
+`_Status` renders a single thread-safe stderr line (TTY only): `⏳ [done/total] file: stage ▰▰▰▱▱▱ ~Ns`. `_STAGE_PROGRESS` maps each stage name to its cumulative progress fraction (profiled on the 4-min fake path — keep in sync if stages are added/reordered); ETA = `elapsed·(1−p)/p`, self-calibrating to the machine (no absolute speed model). Batch mode adds `batch ~Ns left` = max(active ETAs) + queued·avg_file_time/workers (`begin(total, workers)`). The engine reports stages via the `status` callback param of `analyse()`; `build_report` reports probe/finalize stages.
 
 ### Detection case study (regression-test this scenario)
 24/96 FLAC → 320 kbps MP3 → 24-bit ALAC originally scored 18/GENUINE: segment vote correctly failed 7/7 (+55) but the clean-silence credit (−50) cancelled it and its early-return skipped the void check (+20). Fix: clean silence is asymmetric evidence (gated −30), no early return. Now scores 78/SUSPICIOUS. Synthetic fixture: pink noise 24/96 with a 3 s muted span → lame 320 → alac.
@@ -190,7 +193,7 @@ Spectral verdict logic lives in `SpectralEngine.analyse()`. Adjust:
 - Main Score deltas in the "Advanced 11-rule forensic suite" block inside `analyse()`
 - Individual metric interpretation strings (the `_interp_*` static methods)
 - Verdict thresholds in `_verdict()` (86/55/31/11 on the 0–100 main score)
-After any threshold change, re-run `python test_dsp.py` and regenerate transcode fixtures (FLAC → lame MP3 → FLAC via ffmpeg) to confirm the genuine/fake separation holds.
+After any threshold change, re-run `python test_dsp.py`, regenerate fixtures with `python testdata/make_fixtures.py` (gitignored; pink-noise sources → MP3/AAC/Opus/Vorbis encodes at 44.1k+48k → FLAC fakes + genuine/vinyl/cassette/dark/mono/spliced controls), and run `python testdata/measure.py` to confirm the separation holds: every walled fake ≥86, every genuine control ≤20. `testdata/profile.py` prints per-stage engine timings.
 
 ### Changing output format
 Modify `print_report()` and `print_batch_summary()` for terminal output, or adjust `_report_to_dict()` for JSON schema changes.
@@ -203,12 +206,13 @@ Add format to either:
 ## File Structure
 ```
 audio-forensic/
-├── audio_forensic.py      (~1,550 lines — all code, no external modules)
+├── audio_forensic.py      (~1,900 lines — all code, no external modules)
 ├── test_dsp.py            (synthetic-signal verification of every DSP metric)
 ├── requirements.txt       (numpy + scipy dependencies + tool notes)
 ├── README.md             (user-facing documentation)
 ├── LICENSE               (MIT)
-└── CLAUDE.md             (this file)
+├── CLAUDE.md             (this file)
+└── testdata/             (gitignored: make_fixtures.py, measure.py, profile.py + generated fixtures)
 ```
 
 ## Testing & Debugging Tips
@@ -224,7 +228,8 @@ audio-forensic/
 
 - **Numpy optional**: Code gracefully degrades if numpy unavailable; SpectralEngine won't run but other analysis continues
 - **Scipy optional**: Without scipy the advanced suite is skipped (warning to stderr, caveat in the report); the base spectral engine still scores into the main scale
-- **Performance**: ~4 s for a genuine 4-min FLAC, ~7 s for a fake (more rules fire). One decode + one cached STFT feeds everything; scipy's pocketfft runs with `workers=-1`; Hilbert envelopes pad to `next_fast_len`; sliding statistics use `uniform_filter1d` running moments; time-domain analyses capped at `TIME_DOMAIN_CAP_S` (180 s). Reference timings live in the footer of every report ("Analysed in X.Xs")
+- **Performance**: ~3.4 s wall for a genuine 4-min FLAC, ~4.6 s for a fake (engine 2.3 s / 3.5 s). One decode + one cached STFT feeds everything; scipy's pocketfft runs with `workers=-1`; `_fft_band_extract` runs float32 and caches the forward rfft per signal (keyed on length + content samples — void/cassette/vinyl all band-slice the same cap); envelopes are rectified+smoothed |x|·π/2 (NOT Hilbert — the analytic transform cost a full complex-FFT round trip for identical transient localization); the side-channel STFT runs at 4× hop with the mid frames strided to match; 9B aliasing uses direct dot-product Pearson on non-overlapping 5 s segments (corrcoef copied arrays); auCDtect moments run float32; time-domain analyses capped at `TIME_DOMAIN_CAP_S` (180 s). Reference timings live in the footer of every report ("Analysed in X.Xs")
+- **Windows pipes**: `main()` reconfigures stdout/stderr to UTF-8 — cp1252 pipes crashed on the report's box-drawing glyphs
 - **Tool dependencies**: All external tool calls return gracefully on failure; missing tools are caught upfront in `main()`
 - **No temp files**: all SoX input arrives via stdin pipes from ffmpeg
 - **Platform support**: Uses `where` (Windows) vs. `which` (Unix) for tool detection; Bash/PowerShell compatible
