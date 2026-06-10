@@ -192,9 +192,12 @@ check("digital void above cutoff -> +20 penalty", s4 == 20 and not v4, f"score {
 # ---------------------------------------------------------------------------
 print("\n== 12. Cassette source profiler (Rule 11) ==")
 tape = brickwall(noise(60.0, amp=0.3), 14000) + noise(60.0, amp=0.01)  # music + audible hiss
-cs, cev = eng._cassette_source(tape, 14000.0, 150.0, mp3_detected=False)
+tape_frames, _, _ = eng._compute_stft(tape)
+cs, cev = eng._cassette_source(tape, tape_frames, bins, 14000.0, 150.0, mp3_detected=False)
 check("tape hiss + flutter -> cassette score >= 30", cs >= 30, f"score {cs}: {len(cev)} rules hit")
-cs_clean, _ = eng._cassette_source(brickwall(noise(60.0, amp=0.3), 14000), 14000.0, 5.0, mp3_detected=True)
+sterile = brickwall(noise(60.0, amp=0.3), 14000)
+sterile_frames, _, _ = eng._compute_stft(sterile)
+cs_clean, _ = eng._cassette_source(sterile, sterile_frames, bins, 14000.0, 5.0, mp3_detected=True)
 check("sterile walled file -> low cassette score", cs_clean < 30, f"score {cs_clean}")
 
 # ---------------------------------------------------------------------------

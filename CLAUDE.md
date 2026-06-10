@@ -39,6 +39,9 @@ python audio_forensic.py track.flac --fast
 
 # Lightweight info only (no spectral analysis)
 python audio_forensic.py track.flac --info
+
+# Control batch concurrency (default: auto, up to 3 files at once)
+python audio_forensic.py *.flac --workers 4
 ```
 
 ## Architecture
@@ -59,16 +62,17 @@ Located at the top of `audio_forensic.py`:
 Extract data from external tools and parse their output:
 - `extract_mediainfo()` → AudioTags & AudioTechnical (from mediainfo JSON)
 - `extract_sox_stats()` → dict of SoX statistics
-- `extract_loudness()` → LoudnessProfile (ffmpeg -af astats/ebur128)
-- `measure_dynamic_range()` → DR score string
+- `extract_loudness()` → (LoudnessProfile, DR score) — **one** ffmpeg process: the stream is split through astats + ebur128 + drmeter simultaneously via `-filter_complex asplit`
 - `check_bit_depth_authenticity()` → 24-bit genuine vs. padded-16-bit detection
-- `measure_phase_correlation()` → Stereo compatibility score
-- `detect_clipping()` → Clipped sample count and severity
-- `map_silence()` → Silent sections and total silence percentage
 - `audit_replaygain()` → ReplayGain tag validation
-- `generate_spectrogram()` → PNG visualization (prefers SoX, falls back to ffmpeg)
+- `generate_spectrogram()` → PNG via SoX (chosen for visual quality), ffmpeg fallback. **`-y` must stay 2ⁿ+1 (513)** — SoX maps that to a fast DFT size; 512 triggers a resampling path ~20× slower.
 
-**Important**: The `_TempWAV` context manager converts unsupported formats (MP3, M4A, AAC, OGG, OPUS, WMA, APE) to WAV for SoX, since SoX doesn't natively support these.
+**Byproduct metrics** (numpy, computed from the SpectralEngine's decode — no extra ffmpeg processes; the old `aphasemeter`/`astats=clipping` invocations were silently-broken filter syntax):
+- `measure_phase_correlation(mid, side, sr)` → per-100ms L/R Pearson correlation
+- `detect_clipping(mid, side)` → samples at 16-bit full scale
+- `map_silence(mid, sr, duration)` → silent runs < -60 dBFS for ≥ 0.5 s
+
+**Important**: For formats SoX can't read (MP3, M4A, AAC, OGG, OPUS, WMA, APE), `extract_sox_stats` pipes a WAV decode from ffmpeg straight into SoX's stdin — no temp files anywhere in the pipeline.
 
 #### 2. **SpectralEngine** (NumPy/SciPy DSP forensic engine)
 Core authenticity verdict engine. One stereo decode feeds everything (mid `(L+R)/2` for mono detectors, side `(L−R)/2` for joint-stereo forensics). One vectorized, chunked complex STFT (`_compute_stft()`) is cached and reused by every detector — magnitude everywhere, phase kept only ≥10 kHz for auCDtect. Silent frames are masked out of all statistics (`_active_frame_mask()`).
@@ -108,8 +112,9 @@ Core authenticity verdict engine. One stereo decode feeds everything (mid `(L+R)
 **Measured detection performance** (synthetic pink-noise fixtures, MP3→FLAC transcodes): 64–160 kbps → 100/100 LIKELY_LOSSY; 192–320 kbps → 78 SUSPICIOUS; genuine/vinyl-sim/dark-master/mono stay ≤20.
 
 #### 3. **Report Generation** (`build_report()` / `build_info_report()`)
-- `build_report()` → Full forensic analysis (calls all extractors + SpectralEngine)
+- `build_report()` → Full forensic analysis. Subprocess-bound extractors (loudness graph, SoX stats, spectrogram, bit-depth probe) run in a ThreadPoolExecutor while the SpectralEngine crunches on the main thread; byproduct metrics reuse the engine's decode. Wall time ≈ max(engine, loudness) instead of the sum of everything (~6× faster).
 - `build_info_report()` → Lightweight metadata only (no spectral analysis)
+- Batch mode processes files concurrently (`--workers`, default auto up to 3); reports print in order with per-file timing in the footer.
 
 #### 4. **Display & Formatting**
 Terminal output with ANSI color codes:
@@ -206,9 +211,9 @@ audio-forensic/
 
 - **Numpy optional**: Code gracefully degrades if numpy unavailable; SpectralEngine won't run but other analysis continues
 - **Scipy optional**: Without scipy the advanced suite is skipped (warning to stderr, caveat in the report); the base spectral engine still scores into the main scale
-- **Performance**: one ffmpeg decode + one STFT per file; Hilbert/filterbank time-domain analyses are capped at `TIME_DOMAIN_CAP_S` (180 s)
+- **Performance**: ~4 s for a genuine 4-min FLAC, ~7 s for a fake (more rules fire). One decode + one cached STFT feeds everything; scipy's pocketfft runs with `workers=-1`; Hilbert envelopes pad to `next_fast_len`; sliding statistics use `uniform_filter1d` running moments; time-domain analyses capped at `TIME_DOMAIN_CAP_S` (180 s). Reference timings live in the footer of every report ("Analysed in X.Xs")
 - **Tool dependencies**: All external tool calls return gracefully on failure; missing tools are caught upfront in `main()`
-- **Temporary files**: `_TempWAV` context manager auto-cleans temporary WAV files
+- **No temp files**: all SoX input arrives via stdin pipes from ffmpeg
 - **Platform support**: Uses `where` (Windows) vs. `which` (Unix) for tool detection; Bash/PowerShell compatible
-- **Batch processing**: No file size limits, processes files sequentially in order given
-- **Spectrogram generation**: Tries SoX first (better visual), falls back to ffmpeg if SoX unavailable
+- **Batch processing**: No file size limits; files run concurrently (`--workers`), output stays in argument order
+- **Spectrogram generation**: SoX rendering (better visual, user preference), ffmpeg showspectrumpic fallback; keep `-y` at 2ⁿ+1
