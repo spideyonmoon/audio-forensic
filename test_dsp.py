@@ -134,8 +134,8 @@ check("randomized HF phase -> high entropy", ent_rand > 4.5, f"{ent_rand:.2f} bi
 
 # ---------------------------------------------------------------------------
 print("\n== 8. Segment voting (AFD PRO) ==")
-w_full, t_full, fake_full = eng._segment_voting(noise(30.0))
-w_wall, t_wall, fake_wall = eng._segment_voting(brickwall(noise(30.0), 15000))
+w_full, t_full, fake_full, _ = eng._segment_voting(noise(30.0))
+w_wall, t_wall, fake_wall, _ = eng._segment_voting(brickwall(noise(30.0), 15000))
 check("full-band noise passes the vote", (not fake_full) and w_full == 0, f"{w_full}/{t_full} walled")
 check("15 kHz walled file fails the vote", fake_wall and w_wall == t_wall, f"{w_wall}/{t_wall} walled")
 
@@ -222,6 +222,32 @@ try:
     check("honest header passes", not dmm2 and not bmm2)
 finally:
     os.unlink(tmp)
+
+# ---------------------------------------------------------------------------
+print("\n== 15. Codec wall fingerprint ==")
+fp = eng._codec_fingerprint(16800)
+check("16.8 kHz wall -> MP3 128 kbps fingerprint", fp is not None and "MP3" in fp[0] and "128" in fp[1], f"{fp}")
+fp_opus = eng._codec_fingerprint(20440)
+check("20.44 kHz wall -> Opus CELT fingerprint", fp_opus is not None and fp_opus[0] == "Opus", f"{fp_opus}")
+check("17.9 kHz (between walls) -> no fingerprint", eng._codec_fingerprint(17900) is None)
+check("near-Nyquist cutoff -> no fingerprint", eng._codec_fingerprint(21800) is None)
+
+# ---------------------------------------------------------------------------
+print("\n== 16. Spliced/partial transcode segmentation ==")
+spliced = np.concatenate([noise(15.0), brickwall(noise(15.0), 16800)])
+w_sp, t_sp, fake_sp, segs_sp = eng._segment_voting(spliced)
+anom = [(t, c, cl) for t, c, cl in segs_sp if 0 < c < 0.85 * (SR / 2) and cl > 25.0]
+check("spliced file: no majority vote (walls above 16.5k)", not fake_sp, f"{w_sp}/{t_sp} walled")
+check("spliced file: >=2 anomalous walled clips found", len(anom) >= 2, f"{len(anom)} anomalous")
+check("anomalous clips sit in the transcoded half", all(t >= 14.0 for t, _, _ in anom),
+      f"offsets {[f'{t:.1f}s' for t, _, _ in anom]}")
+w_g, t_g, fake_g, segs_g = eng._segment_voting(noise(30.0))
+check("genuine: full-band clips, no cliffs", all(c > 21000 and cl < 25.0 for _, c, cl in segs_g))
+
+mute = noise(30.0)
+mute[int(6.5 * SR):int(9.5 * SR)] = 0.0
+w_m, t_m, fake_m, segs_m = eng._segment_voting(mute)
+check("silent clips are skipped, not counted as walled", t_m < 9 and w_m == 0 and not fake_m, f"{w_m}/{t_m} walled")
 
 # ---------------------------------------------------------------------------
 failed = [n for n, ok, _ in _results if not ok]

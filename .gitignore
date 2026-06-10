@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 *_spectrogram.png
-testdata/
+testdata/*
+!testdata/make_fixtures.py
+!testdata/measure.py
+!testdata/profile.py
 research/
