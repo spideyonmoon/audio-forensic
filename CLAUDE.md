@@ -1,0 +1,214 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**Audio Forensic** is a command-line tool for comprehensive audio authenticity analysis. Unlike generic audio tools that falsely flag normal mastered audio, this tool uses calibrated thresholds specifically tuned for real-world commercially mastered audio.
+
+- **Language**: Python 3.8+
+- **Main file**: `audio_forensic.py` (~1,550 lines)
+- **Entry point**: `main()` function using argparse for CLI
+- **Key dependencies**: numpy (base spectral engine), scipy (advanced forensic suite — degrades gracefully if missing), plus external tools (ffmpeg, sox, mediainfo)
+- **Tests**: `test_dsp.py` — self-contained synthetic-signal verification of every DSP metric (`python test_dsp.py`, no audio files/tools needed)
+
+## Development & Running
+
+### Install dependencies
+```bash
+pip install -r requirements.txt
+# Also install system tools:
+# - ffmpeg (audio decoding)
+# - sox (statistical analysis)
+# - mediainfo (metadata extraction)
+```
+
+### Run the tool
+```bash
+# Single file analysis (full forensics)
+python audio_forensic.py "path/to/audio.flac"
+
+# Batch processing (multiple files)
+python audio_forensic.py *.flac
+
+# JSON output (for scripting)
+python audio_forensic.py track.flac --json
+
+# Fast mode (first 60 seconds only)
+python audio_forensic.py track.flac --fast
+
+# Lightweight info only (no spectral analysis)
+python audio_forensic.py track.flac --info
+```
+
+## Architecture
+
+### Data Models (Dataclasses)
+
+Located at the top of `audio_forensic.py`:
+- **`AudioTags`**: Metadata (title, artist, album, ReplayGain tags)
+- **`AudioTechnical`**: Technical specs (bit depth, channels, sample rate, duration)
+- **`LoudnessProfile`**: All loudness metrics from ffmpeg/sox (LUFS, DR, crest factor, RMS, etc.)
+- **`SpectralAnalysis`**: FFT-based verdict engine output (cutoff frequency, scoring, evidence)
+- **`AuthenticityReport`**: Final combined verdict (includes phase, clipping, bit depth checks)
+- **`ForensicReport`**: Complete report wrapping all the above plus file path and spectrogram
+
+### Key Components
+
+#### 1. **Tool Extractors** (`extract_*` functions)
+Extract data from external tools and parse their output:
+- `extract_mediainfo()` → AudioTags & AudioTechnical (from mediainfo JSON)
+- `extract_sox_stats()` → dict of SoX statistics
+- `extract_loudness()` → LoudnessProfile (ffmpeg -af astats/ebur128)
+- `measure_dynamic_range()` → DR score string
+- `check_bit_depth_authenticity()` → 24-bit genuine vs. padded-16-bit detection
+- `measure_phase_correlation()` → Stereo compatibility score
+- `detect_clipping()` → Clipped sample count and severity
+- `map_silence()` → Silent sections and total silence percentage
+- `audit_replaygain()` → ReplayGain tag validation
+- `generate_spectrogram()` → PNG visualization (prefers SoX, falls back to ffmpeg)
+
+**Important**: The `_TempWAV` context manager converts unsupported formats (MP3, M4A, AAC, OGG, OPUS, WMA, APE) to WAV for SoX, since SoX doesn't natively support these.
+
+#### 2. **SpectralEngine** (NumPy/SciPy DSP forensic engine)
+Core authenticity verdict engine. One stereo decode feeds everything (mid `(L+R)/2` for mono detectors, side `(L−R)/2` for joint-stereo forensics). One vectorized, chunked complex STFT (`_compute_stft()`) is cached and reused by every detector — magnitude everywhere, phase kept only ≥10 kHz for auCDtect. Silent frames are masked out of all statistics (`_active_frame_mask()`).
+
+**Key constants**:
+- `WINDOW = 4096; HOP = 2048` — FFT frame size and stride
+- `CUTOFF_DB = -65.0` — Energy threshold for detecting spectral rolloff
+- `NYQUIST_MARGIN = 0.85` — Cutoff must be below 85% of Nyquist to be suspicious
+- `TIME_DOMAIN_CAP_S = 180` — Hilbert/filterbank analyses capped to bound CPU/RAM
+- `MP3_CUTOFFS` — empirically measured LAME lowpass cutoffs per bitrate (-65 dB point)
+
+**Base scoring** (legacy evidence engine, feeds 45 of the 100 main-score points):
+- `SCORE_*` / `NATURAL_*` constants, `MAX_LOSSY_SCORE = 14`
+
+**Base spectral methods**:
+- `_decode_audio()` / `_decode_stereo()` — FFmpeg to numpy array conversion
+- `_cutoff_per_frame()` — vectorized per-frame spectral rolloff detection
+- `_sharpness()` / `_cliff_depth()` — cliff gradient (dB/bin) and drop across ±400 Hz (codec walls fall 35+ dB/800 Hz; natural fades don't)
+- `_hf_energy_ratio()`, `_banding_score()`, `_noise_floor_above_cutoff()`, `_side_channel_anomaly()`, `_lpf_scan()`, `_dsd_scan()`, `_spectral_entropy()`
+
+**Advanced forensic suite** (scipy; each method returns score deltas + evidence strings):
+- `_check_header_integrity()` — Fakin' the Funk: container duration vs decoded sample count (free — uses the existing decode), bitrate-vs-filesize plausibility for lossy containers
+- `_segment_voting()` — AFD PRO: 7 spread 2s clips wall-checked, majority vote (+55). Wall threshold is **adaptive**: a >30 dB cliff with a verified digital void above it moves the wall from 16.5 kHz to cutoff+400, which is what catches 192–320 kbps transcodes
+- `_aucdtect_features()` — bound frequency via spectral scatter collapse (5-bin sliding std of log power; bins <-110 dB rel clamped so decoder residue reads as void) + high-band phase-difference entropy (>4.5 bits with depressed cutoff = quantized HF phase). Note: the bound check is defeated by 16-bit re-quantization noise on 16-bit fakes — the void/wall detectors cover those; auCDtect covers float/24-bit fakes
+- `_silence_and_vinyl()` — 3-phase: dither ratio inside silent passages (±50), digital-void-above-cutoff (+20), vinyl surface noise (random autocorr + stable energy, −40) and click counting (−10)
+- `_psychoacoustic_artifacts()` — pre-echo (HF energy before transients), HF filterbank aliasing correlation, MP3 32-band subband comb (spectral autocorrelation at 689 Hz multiples)
+- `_cassette_source()` — Rule 11 veto: tape hiss + natural slope + wow/flutter; score ≥30 subtracts 40 and disarms the segment vote
+- `_spectral_sparsity()` — psychoacoustically zeroed bins (<-95 dB rel) *below* the cutoff
+- `_ultrasonic_envelope_correlation()` — Pearson corr of mid-band vs high-band envelopes; exposes anti-forensic fake HF noise injection when combined with a collapsed auCDtect bound
+- `_fft_band_extract()` — zero-phase FFT brickwall band isolation. **Use this, not Butterworth, for noise-floor measurement**: IIR skirts (~24 dB/oct) leak loud music into a quiet band ~0.1 octave away
+- `analyse()` — orchestrates the 11-rule flow, combines into **Main Score (0–100)**
+
+**Main Score verdict thresholds** (`_verdict()`): ≥86 LIKELY_LOSSY · ≥55 SUSPICIOUS · ≥31 CAUTION · ≥11 LIKELY_GENUINE · <11 GENUINE. Natively lossy formats (.mp3 etc.) keep the informational CAUTION path. scipy missing → base engine only + warning caveat.
+
+**Verdict labels**: GENUINE, LIKELY_GENUINE, CAUTION, SUSPICIOUS, LIKELY_LOSSY, INCONCLUSIVE
+
+**Measured detection performance** (synthetic pink-noise fixtures, MP3→FLAC transcodes): 64–160 kbps → 100/100 LIKELY_LOSSY; 192–320 kbps → 78 SUSPICIOUS; genuine/vinyl-sim/dark-master/mono stay ≤20.
+
+#### 3. **Report Generation** (`build_report()` / `build_info_report()`)
+- `build_report()` → Full forensic analysis (calls all extractors + SpectralEngine)
+- `build_info_report()` → Lightweight metadata only (no spectral analysis)
+
+#### 4. **Display & Formatting**
+Terminal output with ANSI color codes:
+- `C` class: Color palette (C.RED, C.GREEN, C.YELLOW, C.BLUE, C.ORANGE, C.CYAN, C.GOLD, C.GREY, C.WHITE)
+- `_c(colour, text)` — Wrap text in color codes
+- `_rule()` / `_section()` / `_subsection()` — Header formatting
+- `_kv(key, value)` — Key-value pair alignment
+- Color functions like `_peak_colour()`, `_lufs_colour()`, `_crest_colour()` — Metric-specific coloring logic
+- `print_report()` → Main formatted terminal output (handles all sections)
+- `print_batch_summary()` → Album-level rollup when multiple files analyzed
+
+#### 5. **CLI Entry Point**
+`main()` function handles:
+- Argument parsing (files, --json, --fast, --info)
+- Tool availability checks (ffmpeg, sox, mediainfo must be in PATH)
+- Batch file processing
+- JSON serialization (via `_report_to_dict()`)
+
+## Metric Reference & Thresholds
+
+### Loudness Metrics
+- **LUFS (Integrated)**: Target -14 (Spotify/Tidal) to -16 (Apple Music)
+- **DR Score**: DR5-8 typical for modern mastered audio; DR10+ = highly dynamic
+- **Crest Factor**: 3-8 dB normal; <3 dB = heavily compressed
+- **True Peak**: -1 dBTP typical; >0 dBTP = clipping
+
+### Spectral Metrics (Forensics)
+- **HF Cutoff**: Normal is 20 kHz (Nyquist at 48kHz) or gradual rolloff starting ~19 kHz. Suspicious if <18 kHz unless explained by format.
+- **Cutoff Variance**: Low variance (<1k Hz²) = rigid/encoded; High variance (>100k Hz²) = natural/organic
+- **Cliff Sharpness**: Gradual <2 dB/bin; sharp cliff >15 dB/bin suggests hard filter
+- **HF Energy Ratio**: <0.005 with low cutoff = suspicious; >0.015 = healthy
+- **Banding Score**: >0.95 with low HF energy = quantization artifacts (lossy indicator)
+- **Side Anomaly**: <0.15 = healthy stereo; >0.7 = severe anomaly (joint stereo artifacts)
+- **Entropy**: Low <0.3 = tonal music (normal); high >0.6 with low cutoff = lossy noise-shaping
+
+### Advanced DSP Metrics (scipy suite)
+- **Cliff Depth**: dB drop across ±400 Hz around cutoff. >35 dB = codec wall; natural fades are single digits
+- **Segment Vote**: walled clips / 7. Majority = +55 (the single strongest lossy signal)
+- **auCDtect Bound**: avg ≥85% Nyquist = lossless-like; <16.5 kHz = statistical void (+25)
+- **HF Phase Entropy**: <4.0 structured; >4.5 bits with depressed cutoff = quantized phase (+10); max is log2(36)≈5.17
+- **Spectral Sparsity**: <0.05 dense; >0.30 below cutoff = codec bin-zeroing (+10)
+- **Ultrasonic Corr.**: >0.6 HF breathes with music; <0.15 + collapsed bound = injected fake noise (+15)
+- **Silence Dither Ratio**: <0.15 clean lossless silence (−50); >0.3 codec hash in silence (+50)
+- **Void above cutoff**: band rms < −85 dBFS (FFT-extracted, cutoff+800 → Nyquist−100) = digital upscale (+20) and arms the adaptive segment-vote wall
+- **Vinyl**: random (autocorr <0.3), stable (var <5 dB) noise above cutoff = analog (−40); 5–50 clicks/min confirms (−10)
+- **Cassette score**: ≥30/80 = tape source veto (−40, disarms segment vote)
+
+## Common Modifications
+
+### Adding a new metric
+1. Add extraction function (calls external tool, returns parsed value)
+2. Add field to appropriate dataclass (AudioTechnical, LoudnessProfile, SpectralAnalysis)
+3. Add coloring logic (e.g., `_new_metric_colour()`)
+4. Add to `print_report()` output section
+5. Update metric reference in README if appropriate
+
+### Adjusting scoring thresholds
+Spectral verdict logic lives in `SpectralEngine.analyse()`. Adjust:
+- Lossy/natural indicator score weights (the `SCORE_*` constants) for the base engine
+- Main Score deltas in the "Advanced 11-rule forensic suite" block inside `analyse()`
+- Individual metric interpretation strings (the `_interp_*` static methods)
+- Verdict thresholds in `_verdict()` (86/55/31/11 on the 0–100 main score)
+After any threshold change, re-run `python test_dsp.py` and regenerate transcode fixtures (FLAC → lame MP3 → FLAC via ffmpeg) to confirm the genuine/fake separation holds.
+
+### Changing output format
+Modify `print_report()` and `print_batch_summary()` for terminal output, or adjust `_report_to_dict()` for JSON schema changes.
+
+### Supporting new audio formats
+Add format to either:
+- `_SOX_UNSUPPORTED` set if SoX doesn't support it natively (will auto-convert to WAV via ffmpeg)
+- Or add tool-specific handling to extractors if special parsing is needed
+
+## File Structure
+```
+audio-forensic/
+├── audio_forensic.py      (~1,550 lines — all code, no external modules)
+├── test_dsp.py            (synthetic-signal verification of every DSP metric)
+├── requirements.txt       (numpy + scipy dependencies + tool notes)
+├── README.md             (user-facing documentation)
+├── LICENSE               (MIT)
+└── CLAUDE.md             (this file)
+```
+
+## Testing & Debugging Tips
+
+- Use `--info` flag to test metadata extraction without full analysis
+- Use `--fast` to speed up development (only processes first 60 seconds)
+- Use `--json` to inspect raw data structure (easier than parsing colored terminal output)
+- Temporarily add `print()` statements in extractors to debug tool output parsing
+- External tools (ffmpeg, sox) output to stderr; check `_run()` calls if a metric fails silently
+- SpectralEngine logs findings in `SpectralAnalysis.evidence` / `natural_evidence` lists for debugging verdict logic
+
+## Important Notes
+
+- **Numpy optional**: Code gracefully degrades if numpy unavailable; SpectralEngine won't run but other analysis continues
+- **Scipy optional**: Without scipy the advanced suite is skipped (warning to stderr, caveat in the report); the base spectral engine still scores into the main scale
+- **Performance**: one ffmpeg decode + one STFT per file; Hilbert/filterbank time-domain analyses are capped at `TIME_DOMAIN_CAP_S` (180 s)
+- **Tool dependencies**: All external tool calls return gracefully on failure; missing tools are caught upfront in `main()`
+- **Temporary files**: `_TempWAV` context manager auto-cleans temporary WAV files
+- **Platform support**: Uses `where` (Windows) vs. `which` (Unix) for tool detection; Bash/PowerShell compatible
+- **Batch processing**: No file size limits, processes files sequentially in order given
+- **Spectrogram generation**: Tries SoX first (better visual), falls back to ffmpeg if SoX unavailable

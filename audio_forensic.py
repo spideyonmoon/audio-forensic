@@ -17,6 +17,20 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
+try:
+    import numpy as np
+    _NUMPY_OK = True
+except ImportError:
+    _NUMPY_OK = False
+
+try:
+    from scipy import signal as _sps
+    from scipy.fft import rfft as _srfft, rfftfreq as _srfftfreq
+    from scipy.ndimage import median_filter as _ndi_median
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+
 # ---------------------------------------------------------------------------
 # ANSI palette & Helpers
 # ---------------------------------------------------------------------------
@@ -79,6 +93,7 @@ class SpectralAnalysis:
     cutoff_hz: float = 0.0; cutoff_hz_str: str = ""
     cutoff_variance: float = 0.0; cutoff_variance_interp: str = ""
     cutoff_sharpness_db: float = 0.0; cutoff_sharpness_interp: str = ""
+    cliff_depth_db: float = 0.0
     hf_energy_ratio: float = 0.0; hf_energy_interp: str = ""
     banding_score: float = 0.0; banding_interp: str = ""
     nf_above_cutoff_db: float = 0.0; nf_interp: str = ""
@@ -92,6 +107,24 @@ class SpectralAnalysis:
     evidence: list[str] = field(default_factory=list)
     natural_evidence: list[str] = field(default_factory=list)
     caveats: list[str] = field(default_factory=list)
+    # --- Advanced DSP suite (scipy) ---
+    main_score: int = 0
+    spectral_sparsity: float = 0.0; sparsity_interp: str = ""
+    hf_envelope_correlation: float = 0.0; hf_env_corr_interp: str = ""
+    preecho_pct: float = 0.0
+    aliasing_corr: float = 0.0
+    mp3_noise_pattern_detected: bool = False
+    cassette_score: int = 0
+    silence_ratio: float = -1.0
+    vinyl_noise_detected: bool = False
+    vinyl_clicks_per_min: float = 0.0
+    header_duration_mismatch: bool = False
+    header_bitrate_mismatch: bool = False
+    segment_walled: int = -1; segment_total: int = 0; segment_wall_hz: float = 16500.0
+    auc_avg_bound_freq: float = 0.0; auc_bound_interp: str = ""
+    auc_prob_bound_freq: float = 0.0
+    auc_phase_entropy: float = 0.0; auc_phase_interp: str = ""
+    scipy_available: bool = True
 
 @dataclass
 class AuthenticityReport:
@@ -101,6 +134,10 @@ class AuthenticityReport:
     phase_verdict: str = ""; clipped_samples: str = ""; clipping_verdict: str = ""
     silence_total_pct: str = ""; silence_sections: list[str] = field(default_factory=list)
     rg_stored: str = ""; rg_measured_lufs: str = ""; rg_delta: str = ""; rg_verdict: str = ""
+    cassette_rip_detected: bool = False
+    vinyl_rip_detected: bool = False
+    side_channel_analysis: str = ""
+    header_integrity: str = ""
 
 @dataclass
 class ForensicReport:
@@ -360,10 +397,41 @@ def generate_spectrogram(filepath: Path) -> Path:
     return output
 
 # ---------------------------------------------------------------------------
-# SpectralEngine — numpy FFT-based authenticity analysis
+# Advanced DSP helpers (scipy-backed; engine degrades gracefully without them)
 # ---------------------------------------------------------------------------
-try: import numpy as np; _NUMPY_OK = True
-except ImportError: _NUMPY_OK = False
+def bandpass_filter(data: "np.ndarray", lowcut: float, highcut: float, fs: int, order: int = 4) -> "np.ndarray":
+    """Apply Butterworth bandpass filter to a 1D NumPy array."""
+    sos = _sps.butter(order, [lowcut, highcut], btype="bandpass", fs=fs, output="sos")
+    return _sps.sosfilt(sos, data)
+
+def highpass_filter(data: "np.ndarray", cutoff: float, fs: int, order: int = 4) -> "np.ndarray":
+    """Apply Butterworth highpass filter."""
+    sos = _sps.butter(order, cutoff, btype="highpass", fs=fs, output="sos")
+    return _sps.sosfilt(sos, data)
+
+def calculate_autocorrelation(data: "np.ndarray", lag: int = 50) -> float:
+    """Normalized absolute autocorrelation at a given sample lag (0 = random noise, 1 = periodic)."""
+    if len(data) <= lag * 2: return 0.0
+    segment = data - np.mean(data)
+    std = np.std(segment)
+    if std < 1e-10: return 0.0
+    segment = segment / std
+    corr = np.corrcoef(segment[:-lag], segment[lag:])[0, 1]
+    return float(np.abs(corr)) if not np.isnan(corr) else 0.0
+
+def calculate_temporal_variance(data: "np.ndarray", sample_rate: int, segment_duration: float = 1.0) -> float:
+    """Standard deviation of per-segment RMS energy in dB over time (tape hiss is very stable)."""
+    seg_samples = int(segment_duration * sample_rate)
+    num_segs = len(data) // seg_samples
+    if num_segs < 2: return 0.0
+    segs = data[: num_segs * seg_samples].reshape(num_segs, seg_samples)
+    rms = np.sqrt(np.mean(segs ** 2, axis=1))
+    energies_db = 20 * np.log10(rms + 1e-12)
+    return float(np.std(energies_db))
+
+# ---------------------------------------------------------------------------
+# SpectralEngine — numpy/scipy FFT-based authenticity analysis
+# ---------------------------------------------------------------------------
 
 class SpectralEngine:
     WINDOW = 4096; HOP = 2048; CUTOFF_DB = -65.0; NYQUIST_MARGIN = 0.85
@@ -373,10 +441,19 @@ class SpectralEngine:
     MAX_LOSSY_SCORE = 14
     NATURAL_GRADUAL_ROLLOFF = 1; NATURAL_HIGH_VARIANCE = 1; NATURAL_MODERATE_VARIANCE = 1
     NATURAL_RICH_HF = 1; NATURAL_HF_NOISE = 1; NATURAL_HEALTHY_SIDE = 1; NATURAL_HIGH_ENTROPY = 1
-    MP3_CUTOFFS = {320: 20500, 256: 20000, 192: 19000, 160: 18500, 128: 16000, 96: 15500, 64: 12000}
+    # Empirically measured LAME lowpass cutoffs (-65 dB point, 95th percentile per frame)
+    MP3_CUTOFFS = {320: 20200, 256: 19550, 224: 19550, 192: 18850, 160: 17450, 128: 16800, 96: 15400, 64: 11100}
 
-    def __init__(self, filepath: Path, sample_rate: int):
+    # Time-domain analyses (Hilbert envelopes, cascaded band filters) are capped to
+    # this many seconds to bound CPU/RAM on very long files; spectral stats use the full decode.
+    TIME_DOMAIN_CAP_S = 180.0
+
+    def __init__(self, filepath: Path, sample_rate: int, channels: int = 2,
+                 claimed_duration: float = 0.0, claimed_bitrate_kbps: int = 0):
         self.filepath = filepath; self.sample_rate = sample_rate; self.nyquist = sample_rate / 2.0
+        self.channels = channels
+        self.claimed_duration = claimed_duration
+        self.claimed_bitrate_kbps = claimed_bitrate_kbps
 
     def _decode_audio(self, max_seconds: Optional[float] = None) -> "np.ndarray | None":
         if not _NUMPY_OK: return None
@@ -400,10 +477,31 @@ class SpectralEngine:
         return (interleaved[:, 0] + interleaved[:, 1]) / 2.0, (interleaved[:, 0] - interleaved[:, 1]) / 2.0
 
     def _compute_frames(self, audio: "np.ndarray") -> "np.ndarray":
-        win = np.hanning(self.WINDOW); frames = []
-        for i in range(0, len(audio) - self.WINDOW, self.HOP):
-            frames.append(np.abs(np.fft.rfft(audio[i:i + self.WINDOW] * win)))
-        return np.array(frames)
+        return self._compute_stft(audio)[0]
+
+    def _compute_stft(self, audio: "np.ndarray") -> "tuple[np.ndarray, np.ndarray, int]":
+        """Vectorized chunked STFT. Returns (magnitude [frames, bins] float32,
+        phase of bins >= 10 kHz [frames, hi_bins] float32, index of first hi bin).
+        Magnitude feeds every spectral detector; high-band phase feeds auCDtect entropy."""
+        n_frames = max(0, (len(audio) - self.WINDOW + self.HOP - 1) // self.HOP)  # == len(range(0, len-WINDOW, HOP))
+        win = np.hanning(self.WINDOW).astype(np.float32)
+        bins = self._freq_bins()
+        bin_hz = bins[1] - bins[0]
+        hi_start = min(len(bins) - 1, int(10000 / bin_hz))
+        idx = np.arange(self.WINDOW)
+        mags, phases = [], []
+        CHUNK = 256
+        for start in range(0, n_frames, CHUNK):
+            cnt = min(CHUNK, n_frames - start)
+            offs = (np.arange(cnt) + start) * self.HOP
+            block = audio[offs[:, None] + idx[None, :]] * win
+            spec = np.fft.rfft(block, axis=1)
+            mags.append(np.abs(spec).astype(np.float32))
+            phases.append(np.angle(spec[:, hi_start:]).astype(np.float32))
+        if not mags:
+            empty = np.zeros((0, len(bins)), dtype=np.float32)
+            return empty, empty[:, hi_start:], hi_start
+        return np.concatenate(mags), np.concatenate(phases), hi_start
 
     def _freq_bins(self) -> "np.ndarray": return np.fft.rfftfreq(self.WINDOW, 1.0 / self.sample_rate)
 
@@ -458,14 +556,50 @@ class SpectralEngine:
         elif e < 9.5: return "[high: complex/dynamic content]" if legit_cutoff else "[high entropy: lossy noise-shaping / VBR footprint]"
         else: return "[very high: noise-like complexity]" if legit_cutoff else "[very high entropy: lossy ultrasonic noise / dithering]"
 
+    def _interp_bound(self, avg_bound: float) -> str:
+        if avg_bound <= 0: return ""
+        if avg_bound >= self.nyquist * 0.85: return "[organic scatter to the ceiling: lossless-like]"
+        elif avg_bound >= 16500: return "[moderate bound: high-bitrate encode or dark master]"
+        else: return "[scatter collapse: statistical void left by a lossy codec]"
+
+    @staticmethod
+    def _interp_phase_entropy(e: float, legit_cutoff: bool) -> str:
+        if e <= 0: return ""
+        if e < 4.0: return "[structured HF phase: tonal/organic]"
+        elif e < 4.5: return "[typical phase complexity]"
+        elif legit_cutoff: return "[high but full-spectrum: dither/noise content]"
+        else: return "[quantized high-band phase: codec disruption]"
+
+    @staticmethod
+    def _interp_sparsity(s: float, legit_cutoff: bool) -> str:
+        if s < 0.05: return "[dense spectrum: no psychoacoustic holes]"
+        elif s < 0.30: return "[some quiet bins: normal for dynamic audio]"
+        elif legit_cutoff: return "[sparse but full-bandwidth: very dynamic content]"
+        else: return "[psychoacoustic holes below cutoff: codec bin-zeroing]"
+
+    @staticmethod
+    def _interp_ultra_corr(c: float) -> str:
+        if c > 0.6: return "[HF breathes with the music: genuine harmonics]"
+        elif c > 0.3: return "[moderate coupling: normal]"
+        elif c > 0.15: return "[weak coupling: noisy or dark HF]"
+        else: return "[HF independent of music: dither, hiss, or injected fake noise]"
+
+    @staticmethod
+    def _active_frame_mask(frames: "np.ndarray") -> "np.ndarray":
+        """Mask of non-silent frames (peak within 60 dB of the loudest frame).
+        Silent passages have no spectral content and poison cutoff/bound statistics."""
+        peaks = frames.max(axis=1)
+        ref = peaks.max() + 1e-12
+        return peaks > ref * 1e-3  # -60 dB
+
     def _cutoff_per_frame(self, frames: "np.ndarray", bins: "np.ndarray") -> "np.ndarray":
-        cutoffs = []
-        for frame in frames:
-            ref = frame.max() + 1e-12
-            db = 20.0 * np.log10(frame / ref + 1e-12)
-            above = np.where(db > self.CUTOFF_DB)[0]
-            cutoffs.append(float(bins[above[-1]]) if len(above) else 0.0)
-        return np.array(cutoffs)
+        if frames.shape[0] == 0: return np.zeros(0)
+        ref = frames.max(axis=1, keepdims=True) + 1e-12
+        db = 20.0 * np.log10(frames / ref + 1e-12)
+        mask = db > self.CUTOFF_DB
+        has_any = mask.any(axis=1)
+        last_idx = mask.shape[1] - 1 - np.argmax(mask[:, ::-1], axis=1)
+        return np.where(has_any, bins[last_idx], 0.0)
 
     def _sharpness(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float, window_hz: float = 2500.0) -> float:
         bin_hz = bins[1] - bins[0]
@@ -474,6 +608,19 @@ class SpectralEngine:
         avg = frames.mean(axis=0)
         db = 20.0 * np.log10(avg[lo:hi] / (avg.max() + 1e-12) + 1e-12)
         return float(np.abs(np.diff(db)).max()) if len(db) > 1 else 0.0
+
+    def _cliff_depth(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float, span_hz: float = 400.0) -> float:
+        """dB drop across ±span_hz around the cutoff. A codec wall falls 35+ dB inside
+        800 Hz; natural rolloff loses a few dB. Complements the per-bin gradient, which
+        under-reads walls whose transition spans dozens of bins."""
+        bin_hz = bins[1] - bins[0]
+        avg = frames.mean(axis=0)
+        ref = avg.max() + 1e-12
+        lo = int(max(0, (cutoff_hz - span_hz) / bin_hz))
+        hi = int(min(len(bins) - 1, (cutoff_hz + span_hz) / bin_hz))
+        if hi <= lo: return 0.0
+        db = 20.0 * np.log10(avg / ref + 1e-12)
+        return float(db[lo] - db[hi])
 
     def _hf_energy_ratio(self, frames: "np.ndarray", bins: "np.ndarray", threshold_hz: float = 15000.0) -> float:
         return float(frames[:, int(threshold_hz / (bins[1] - bins[0])):].sum()) / (float(frames.sum()) + 1e-12)
@@ -496,23 +643,385 @@ class SpectralEngine:
         if above.size == 0: return -120.0
         return float(20.0 * np.log10(float(np.sqrt(np.mean(above ** 2))) + 1e-12))
 
-    def _side_channel_anomaly(self, mid: "np.ndarray", side: "np.ndarray", bins: "np.ndarray") -> float:
-        if not _NUMPY_OK or mid is None or side is None or len(mid) < self.WINDOW * 2: return 0.0
-        mid_frames = self._compute_frames(mid)
+    def _side_channel_anomaly(self, mid_frames: "np.ndarray", side: "np.ndarray", bins: "np.ndarray") -> float:
+        """Joint-stereo forensics on y_side = (L−R)/2 — codecs starve the side channel of HF first."""
+        if not _NUMPY_OK or side is None or len(side) < self.WINDOW * 2: return 0.0
         side_frames = self._compute_frames(side)
 
         bin_hz = bins[1] - bins[0]
         idx_10k = int(10000 / bin_hz)
         if idx_10k >= mid_frames.shape[1]: return 0.0
 
-        mid_hf = mid_frames[:, idx_10k:]
-        side_hf = side_frames[:, idx_10k:]
+        n = min(mid_frames.shape[0], side_frames.shape[0])
+        mid_hf = mid_frames[:n, idx_10k:]
+        side_hf = side_frames[:n, idx_10k:]
 
         e_ratio = float(np.mean(side_hf)) / (float(np.mean(mid_hf)) + 1e-12)
         score, wt = 0.0, 1.0
         if e_ratio < 0.02: score += 1.0
         elif e_ratio < 0.08: score += 0.6
         return float(score / wt)
+
+    # -----------------------------------------------------------------------
+    # auCDtect-style statistical analysis (bound frequency + high-band phase)
+    # -----------------------------------------------------------------------
+    def _aucdtect_features(self, frames: "np.ndarray", phase_hi: "np.ndarray", bins: "np.ndarray") -> tuple[float, float, float]:
+        """Returns (avg_bound_freq, most_probable_bound_freq, high_band_phase_entropy).
+
+        Bound frequency: per frame, the spectral 'scatter' (5-bin sliding std of log power)
+        stays organic (>0.6) wherever real signal/dither lives and collapses to ~0 in the
+        digitally voided region a lossy codec leaves behind. Bins more than 110 dB below the
+        frame peak are clamped first so numerical decoder residue reads as a true void.
+        Robust against flat noise injection — uniform fake noise has near-zero scatter too.
+        """
+        if frames.shape[0] < 4 or frames.shape[1] < 10:
+            return 0.0, 0.0, 0.0
+        ref = frames.max(axis=1, keepdims=True) + 1e-12
+        db = 20.0 * np.log10(frames / ref + 1e-12)
+        db = np.maximum(db, -110.0)               # clamp: decoder numerical residue -> constant
+        log_power = (db / 10.0) * np.log(10.0)    # back to natural-log power scale
+
+        sw = np.lib.stride_tricks.sliding_window_view(log_power, 5, axis=1)
+        scatter = sw.std(axis=-1)
+        if _SCIPY_OK:
+            scatter = _ndi_median(scatter, size=(1, 5), mode="nearest")
+
+        max_sc = scatter.max(axis=1, keepdims=True)
+        thresh = np.minimum(0.6, max_sc * 0.25)
+        organic = scatter >= thresh
+        has_any = organic.any(axis=1)
+        last_idx = organic.shape[1] - 1 - np.argmax(organic[:, ::-1], axis=1)
+        bound_bins = np.where(has_any, last_idx + 2, 0)   # +2: sliding-window centre offset
+        bound_freqs = bins[np.minimum(bound_bins, len(bins) - 1)]
+
+        avg_bound = float(np.mean(bound_freqs))
+        hist, edges = np.histogram(bound_freqs, bins=min(20, frames.shape[1]))
+        mi = int(np.argmax(hist))
+        prob_bound = float((edges[mi] + edges[mi + 1]) / 2.0)
+
+        # High-band (>=10 kHz) phase-difference entropy: lossy codecs randomize HF phase.
+        phase_entropy = 0.0
+        if phase_hi.shape[0] >= 3 and phase_hi.shape[1] >= 2:
+            pd = np.diff(phase_hi.astype(np.float64), axis=0)
+            pdw = np.arctan2(np.sin(pd), np.cos(pd))
+            hist_p, _ = np.histogram(pdw, bins=36, range=(-np.pi, np.pi))
+            p = hist_p / (hist_p.sum() + 1e-12)
+            p = p[p > 0]
+            phase_entropy = float(-np.sum(p * np.log2(p)))
+
+        return avg_bound, prob_bound, phase_entropy
+
+    # -----------------------------------------------------------------------
+    # Fakin' the Funk — header integrity (duration & bitrate plausibility)
+    # -----------------------------------------------------------------------
+    def _check_header_integrity(self, decoded_duration: float) -> tuple[bool, bool, list[str]]:
+        duration_mismatch, bitrate_mismatch, reasons = False, False, []
+        if self.claimed_duration > 0 and decoded_duration > 0:
+            diff = abs(decoded_duration - self.claimed_duration)
+            if diff > 0.5:
+                duration_mismatch = True
+                reasons.append(f"Header Mismatch: Container claims {self.claimed_duration:.2f}s but the frame decoder yields {decoded_duration:.2f}s (Δ {diff:.2f}s) — header has been forged or the stream is truncated.")
+        ext = self.filepath.suffix.lower()
+        if self.claimed_bitrate_kbps > 0 and self.claimed_duration > 1.0 and ext in {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma"}:
+            try:
+                actual_kbps = self.filepath.stat().st_size * 8.0 / self.claimed_duration / 1000.0
+                if actual_kbps < self.claimed_bitrate_kbps * 0.80 or actual_kbps > self.claimed_bitrate_kbps * 1.35:
+                    bitrate_mismatch = True
+                    reasons.append(f"Bitrate Forgery: Header claims {self.claimed_bitrate_kbps} kbps but file size implies ~{actual_kbps:.0f} kbps of actual payload.")
+            except OSError:
+                pass
+        return duration_mismatch, bitrate_mismatch, reasons
+
+    # -----------------------------------------------------------------------
+    # Audio Fake Detector PRO — N-segment wall-check voting
+    # -----------------------------------------------------------------------
+    def _segment_voting(self, audio: "np.ndarray", n_segments: int = 7, wall_hz: float = 16500.0) -> tuple[int, int, bool]:
+        """Cutoff-walls N spread-out 2 s clips and takes a majority vote.
+        Catches files where only parts were transcoded (spliced fakes).
+        wall_hz is adaptive: when the global cutoff has a verified digital void above it,
+        the wall threshold tracks that cutoff instead of the fixed AFD 16.5 kHz."""
+        if self.nyquist <= wall_hz: return -1, 0, False
+        total = len(audio)
+        seg_samples = int(2.0 * self.sample_rate)
+        if total < seg_samples * n_segments: return -1, 0, False
+
+        import random
+        rng = random.Random(42)  # deterministic
+        offsets = []
+        step = (total - seg_samples) // (n_segments - 1)
+        for i in range(n_segments - 2):
+            offsets.append(i * step)
+        offsets.append(rng.randint(0, total - seg_samples))
+        offsets.append(total - seg_samples)
+
+        walled = 0
+        win = np.hanning(seg_samples)
+        freqs = np.fft.rfftfreq(seg_samples, 1.0 / self.sample_rate)
+        for off in offsets:
+            clip = audio[off : off + seg_samples].astype(np.float64)
+            mag = np.abs(np.fft.rfft(clip * win))
+            ref = mag.max() + 1e-12
+            db = 20 * np.log10(mag / ref + 1e-12)
+            above = np.where(db > self.CUTOFF_DB)[0]
+            cutoff = freqs[above[-1]] if len(above) else 0.0
+            if cutoff <= wall_hz:
+                walled += 1
+
+        if n_segments % 2 == 0: is_fake = walled >= (n_segments / 2)
+        else: is_fake = walled > (n_segments / 2)
+        return walled, n_segments, bool(is_fake)
+
+    def _fft_band_extract(self, x: "np.ndarray", lo: float, hi: float) -> "np.ndarray":
+        """Zero-phase brickwall band extraction via FFT masking. IIR skirts (~24 dB/oct)
+        leak loud music into a quiet band only ~0.1 octave away; spectral masking gives
+        total rejection, which noise-floor forensics above the cutoff depend on."""
+        X = np.fft.rfft(x.astype(np.float64))
+        f = np.fft.rfftfreq(len(x), 1.0 / self.sample_rate)
+        X[(f < lo) | (f > hi)] = 0.0
+        return np.fft.irfft(X, n=len(x))
+
+    # -----------------------------------------------------------------------
+    # 3-Phase silence / dither / vinyl-surface-noise analyser
+    # -----------------------------------------------------------------------
+    def _silence_and_vinyl(self, audio: "np.ndarray", cutoff_hz: float, noise_band: "np.ndarray | None" = None) -> tuple[int, list[str], float, bool, float]:
+        """Phase 1: dither energy ratio inside silent passages (codec noise vs clean dither).
+        Phase 2: noise floor character above the cutoff (vinyl hiss is random & stable).
+        Phase 3: click/pop transient counting to confirm a vinyl source."""
+        score, reasons = 0, []
+        silence_ratio, vinyl_detected, clicks_per_min = -1.0, False, 0.0
+        sr = self.sample_rate
+
+        # --- Phase 1: silence dither ratio
+        threshold_linear = 10 ** (-40.0 / 20.0)
+        is_sil = np.abs(audio) < threshold_linear
+        padded = np.concatenate(([False], is_sil, [False]))
+        d = np.diff(padded.astype(np.int8))
+        starts, ends = np.where(d == 1)[0], np.where(d == -1)[0]
+        min_samples = int(0.5 * sr)
+        sil_segs = [(s, e) for s, e in zip(starts, ends) if (e - s) >= min_samples]
+        total_sil_sec = sum(e - s for s, e in sil_segs) / sr
+
+        if total_sil_sec >= 2.0:
+            if len(audio) >= int(40 * sr): music_ref = audio[int(10 * sr):int(40 * sr)]
+            else: music_ref = audio
+            sil_cap = int(30 * sr)
+            silence_ref = np.concatenate([audio[s:e] for s, e in sil_segs])[:sil_cap]
+            upper_limit = min(22000.0, sr / 2 - 100)
+
+            def hf_energy(segment: "np.ndarray") -> float:
+                # Normalize by N² so the ratio is invariant to segment length
+                # (Parseval: band sum of |X|² scales with N²·power).
+                if len(segment) < 1024: return 0.0
+                win = np.hanning(len(segment))
+                fft_res = np.abs(np.fft.rfft(segment * win)) ** 2
+                freqs = np.fft.rfftfreq(len(segment), 1.0 / sr)
+                idx = (freqs >= 16000) & (freqs <= upper_limit)
+                return float(np.sum(fft_res[idx]) / len(segment) ** 2) if np.any(idx) else 0.0
+
+            e_music, e_silence = hf_energy(music_ref), hf_energy(silence_ref)
+            if e_music > 0:
+                silence_ratio = e_silence / (e_music + 1e-12)
+                if silence_ratio > 0.3:
+                    score += 50
+                    reasons.append(f"Codec Noise in Silence: silent passages carry {silence_ratio:.2f}× the music's ultrasonic energy — artificial dither/codec hash, not clean studio silence.")
+                    return score, reasons, silence_ratio, False, 0.0
+                elif silence_ratio < 0.15:
+                    score -= 50
+                    reasons.append(f"Clean Silence Floor: silent passages are spectrally clean (ratio {silence_ratio:.2f}) — consistent with an unmolested lossless master.")
+                    return score, reasons, silence_ratio, False, 0.0
+
+        # --- Phase 2: vinyl surface noise above the cutoff
+        # Band starts 1 kHz above the detected cutoff; FFT brickwall extraction so
+        # music-band energy cannot leak in and masquerade as a noise floor.
+        cap = audio[: int(self.TIME_DOMAIN_CAP_S * sr)]
+        if noise_band is not None or 0 < cutoff_hz < self.nyquist - 2100:
+            if noise_band is None:
+                noise_band = self._fft_band_extract(cap, cutoff_hz + 1000, self.nyquist - 100)
+            rms = float(np.sqrt(np.mean(noise_band ** 2)))
+            energy_db = 20 * math.log10(rms + 1e-12)
+            if energy_db < -70.0:
+                score += 20
+                reasons.append(f"Digital Upscale Suspect: no noise floor above the cutoff ({energy_db:.1f} dB) — analog sources always leave hiss there.")
+            else:
+                autocorr = calculate_autocorrelation(noise_band, lag=50)
+                variance = calculate_temporal_variance(noise_band, sr)
+                if autocorr < 0.3 and variance < 5.0:
+                    vinyl_detected = True
+                    score -= 40
+                    reasons.append(f"Vinyl Surface Noise: random ({autocorr:.2f} autocorr), temporally stable hiss above the cutoff ({energy_db:.1f} dB) — analog playback signature.")
+
+                    # --- Phase 3: clicks & pops
+                    hp = highpass_filter(cap.astype(np.float64), 1000, sr)
+                    env = np.abs(_sps.hilbert(hp, N=len(hp)))
+                    k = int(0.0005 * sr) | 1
+                    env_smooth = _ndi_median(env, size=k, mode="nearest")
+                    peaks, _ = _sps.find_peaks(env_smooth, height=float(np.median(env_smooth)) * 3, distance=int(0.01 * sr))
+                    clicks_per_min = (len(peaks) / (len(cap) / sr)) * 60
+                    if 5 <= clicks_per_min <= 50:
+                        score -= 10
+                        reasons.append(f"Vinyl Clicks Confirmed: {clicks_per_min:.1f} click transients/min — physical media artefacts.")
+
+        return score, reasons, silence_ratio, vinyl_detected, clicks_per_min
+
+    # -----------------------------------------------------------------------
+    # Psychoacoustic artefacts — pre-echo, HF aliasing, MP3 subband comb
+    # -----------------------------------------------------------------------
+    def _psychoacoustic_artifacts(self, audio: "np.ndarray", frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float, mp3_detected: bool) -> tuple[int, list[str], float, float, bool]:
+        score, reasons = 0, []
+        preecho_pct, aliasing_corr, mp3_noise_pattern = 0.0, 0.0, False
+        sr = self.sample_rate
+        if cutoff_hz >= 21000 and not mp3_detected:
+            return score, reasons, 0.0, 0.0, False
+
+        cap = audio[: int(self.TIME_DOMAIN_CAP_S * sr)].astype(np.float64)
+
+        # 9A: Pre-echo — MDCT block smearing leaks HF energy *before* sharp transients
+        env = np.abs(_sps.hilbert(cap, N=len(cap)))
+        k = int(0.001 * sr) | 1
+        env_smooth = _ndi_median(env, size=k, mode="nearest")
+        peaks, _ = _sps.find_peaks(env_smooth, height=10 ** (-3.0 / 20.0), distance=int(0.05 * sr))
+        if len(peaks) > 0:
+            hf = bandpass_filter(cap, 10000, min(20000, self.nyquist - 100), sr)
+            baseline = float(np.median(hf ** 2))
+            pre_w, post_w = int(0.02 * sr), int(0.01 * sr)
+            affected = 0
+            for p in peaks:
+                if p < pre_w + post_w: continue
+                pre_energy = float(np.mean(hf[p - pre_w : p - post_w] ** 2))
+                if pre_energy > baseline * 3: affected += 1
+            preecho_pct = (affected / len(peaks)) * 100
+            if preecho_pct > 10:
+                score += 15
+                reasons.append(f"Pre-Echo Smearing: {preecho_pct:.1f}% of transients show HF energy bleeding backwards in time — MDCT block artefact.")
+            elif preecho_pct >= 5:
+                score += 10
+                reasons.append(f"Moderate Pre-Echo: {preecho_pct:.1f}% of transients show pre-transient HF leakage.")
+
+        # 9B: HF aliasing — filterbank aliasing mirrors 10-15k into inverted 15-20k
+        if self.nyquist >= 15000:
+            band_a = bandpass_filter(cap, 10000, 15000, sr)
+            band_b_inv = -bandpass_filter(cap, 15000, min(20000, self.nyquist - 100), sr)
+            seg_len = min(len(band_a), int(sr * 5))
+            corrs = []
+            for i in range(0, len(band_a) - seg_len + 1, max(1, seg_len // 2)):
+                sa, sb = band_a[i : i + seg_len], band_b_inv[i : i + seg_len]
+                if np.std(sa) > 1e-6 and np.std(sb) > 1e-6:
+                    c = np.abs(np.corrcoef(sa, sb)[0, 1])
+                    if not np.isnan(c): corrs.append(float(c))
+            aliasing_corr = float(np.median(corrs)) if corrs else 0.0
+            if aliasing_corr > 0.5:
+                score += 15
+                reasons.append(f"Severe Filterbank Aliasing: mirrored HF correlation {aliasing_corr:.2f} — codec synthesis artefact.")
+            elif aliasing_corr >= 0.3:
+                score += 10
+                reasons.append(f"Moderate Filterbank Aliasing: mirrored HF correlation {aliasing_corr:.2f}.")
+
+        # 9C: MP3 subband comb — 32-band filterbank leaves spectral peaks every 689.06 Hz
+        if self.nyquist >= 16000 and frames.shape[0] >= 4:
+            bin_hz = bins[1] - bins[0]
+            lo, hi = int(16000 / bin_hz), min(frames.shape[1], int(min(20000.0, self.nyquist - 100) / bin_hz))
+            if hi - lo > 80:
+                avg_db = 20.0 * np.log10(frames[:, lo:hi].mean(axis=0) + 1e-12)
+                spec = avg_db - avg_db.mean()
+                denom = float(np.sum(spec ** 2)) + 1e-12
+                subband_hz = self.sample_rate / 64.0  # MP3 subband width (689.06 Hz @ 44.1k)
+                peaks_found = 0
+                for mult in (1, 2, 3):
+                    lag = int(round(mult * subband_hz / bin_hz))
+                    if lag <= 0 or lag >= len(spec) - 1: continue
+                    ac = float(np.sum(spec[:-lag] * spec[lag:])) / denom
+                    neighbours = []
+                    for nl in (lag - 3, lag + 3):
+                        if 0 < nl < len(spec) - 1:
+                            neighbours.append(abs(float(np.sum(spec[:-nl] * spec[nl:])) / denom))
+                    if ac > 0.25 and (not neighbours or ac > 2 * max(neighbours)):
+                        peaks_found += 1
+                if peaks_found >= 2:
+                    mp3_noise_pattern = True
+                    score += 10
+                    reasons.append("MP3 Subband Comb: periodic spectral structure at 689 Hz multiples — 32-band filterbank residue.")
+
+        return score, reasons, preecho_pct, aliasing_corr, mp3_noise_pattern
+
+    # -----------------------------------------------------------------------
+    # Rule 11 — analogue cassette source profiler (false-positive bypass)
+    # -----------------------------------------------------------------------
+    def _cassette_source(self, audio: "np.ndarray", cutoff_hz: float, cutoff_std: float, mp3_detected: bool) -> tuple[int, list[str]]:
+        score, reasons = 0, []
+        if cutoff_hz >= 19000: return 0, reasons
+        sr = self.sample_rate
+        cap = audio[: int(60.0 * sr)].astype(np.float64)
+
+        # 11A: constant tape hiss above the musical cutoff (FFT brickwall — no music leakage)
+        upper_limit = min(20000.0, sr / 2 - 100)
+        noise_lo = cutoff_hz + 1000 if cutoff_hz < 16000 else cutoff_hz + 500
+        if upper_limit > noise_lo:
+            noise_sig = self._fft_band_extract(cap, noise_lo, upper_limit)
+            noise_db = 20 * math.log10(float(np.std(noise_sig)) + 1e-12)
+            autocorr = calculate_autocorrelation(noise_sig, lag=100)
+            if noise_db > -55.0 and autocorr < 0.2:
+                score += 30
+                reasons.append(f"R11A: Tape hiss present above cutoff ({noise_db:.1f} dB, random autocorr {autocorr:.2f}).")
+
+        # 11B: natural magnetic-tape roll-off slope across 12-18 kHz
+        freqs = np.linspace(12000, 18000, 20)
+        res = []
+        for f in freqs:
+            if f + 250 < sr / 2:
+                band_sig = bandpass_filter(cap, f - 250, f + 250, sr)
+                res.append(20 * math.log10(float(np.std(band_sig)) + 1e-12))
+            else:
+                res.append(-120.0)
+        slope = (res[-1] - res[0]) / 6.0
+        if -6.0 < slope < -3.0:
+            score += 20
+            reasons.append(f"R11B: Natural tape roll-off slope ({slope:.1f} dB/kHz) — gradual analog decay, not a brick wall.")
+        elif slope < -10.0:
+            score -= 20
+
+        # 11C: no codec filterbank artefacts
+        if not mp3_detected:
+            score += 15
+            reasons.append("R11C: No codec subband artefacts found.")
+
+        # 11D: wow/flutter — tape speed instability modulates the cutoff
+        if 50 < cutoff_std < 300:
+            score += 15
+            reasons.append(f"R11D: Wow/flutter spectral modulation (cutoff σ {cutoff_std:.0f} Hz).")
+        elif cutoff_std < 30:
+            score -= 10
+
+        return max(0, score), reasons
+
+    # -----------------------------------------------------------------------
+    # Spectral sparsity & ultrasonic envelope correlation (anti-forensics)
+    # -----------------------------------------------------------------------
+    def _spectral_sparsity(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float) -> float:
+        """Fraction of psychoacoustically zeroed bins (<-95 dB rel.) BELOW the cutoff —
+        codecs punch holes in the audible band that no natural recording has."""
+        bin_hz = bins[1] - bins[0]
+        cutoff_idx = min(frames.shape[1], int(cutoff_hz / bin_hz))
+        if cutoff_idx < 10 or frames.shape[0] == 0: return 0.0
+        region = frames[:, :cutoff_idx]
+        ref = frames.max(axis=1, keepdims=True) + 1e-12
+        db = 20.0 * np.log10(region / ref + 1e-12)
+        return float(np.sum(db < -95.0) / (db.size + 1e-12))
+
+    def _ultrasonic_envelope_correlation(self, frames: "np.ndarray", bins: "np.ndarray") -> float:
+        """Pearson correlation between the mid-band (1-8 kHz) and high-band (16-22 kHz)
+        energy envelopes. Genuine HF content breathes with the music; injected fake
+        ultrasonic noise (anti-forensic masking) is statistically independent of it."""
+        if frames.shape[0] < 10: return 1.0
+        bin_hz = bins[1] - bins[0]
+        m_lo, m_hi = int(1000 / bin_hz), int(8000 / bin_hz)
+        h_lo, h_hi = int(16000 / bin_hz), min(frames.shape[1], int(22000 / bin_hz))
+        if h_hi <= h_lo or m_hi <= m_lo: return 1.0
+        env_mid = np.sqrt(np.mean(frames[:, m_lo:m_hi].astype(np.float64) ** 2, axis=1))
+        env_high = np.sqrt(np.mean(frames[:, h_lo:h_hi].astype(np.float64) ** 2, axis=1))
+        std_mid, std_high = float(np.std(env_mid)), float(np.std(env_high))
+        if std_mid < 1e-8 or std_high < 1e-8: return 0.0
+        corr = float(np.mean((env_mid - env_mid.mean()) * (env_high - env_high.mean())) / (std_mid * std_high))
+        return corr
 
     def _lpf_scan(self, frames: "np.ndarray", bins: "np.ndarray") -> tuple[bool, str]:
         thz = self.nyquist * 0.90
@@ -543,18 +1052,22 @@ class SpectralEngine:
         p = (avg / (avg.sum() + 1e-12)); p = p[p > 0]
         return float(-np.sum(p * np.log2(p)))
 
-    def _score(self, cutoff_hz: float, variance: float, sharpness: float, hf_ratio: float, nf_above: float, banding: float, side_anomaly: float, entropy: float, dsd_detected: bool) -> tuple[int, list[str], int, list[str]]:
+    def _score(self, cutoff_hz: float, variance: float, sharpness: float, cliff_depth: float, hf_ratio: float, nf_above: float, banding: float, side_anomaly: float, entropy: float, dsd_detected: bool) -> tuple[int, list[str], int, list[str]]:
         l_score, l_ev, n_score, n_ev = 0, [], 0, []
 
         if cutoff_hz < self.nyquist * 0.85 and cutoff_hz < 18500:
             l_score += self.SCORE_CUTOFF_WELL_BELOW_NYQUIST
             l_ev.append(f"Premature High-Frequency Rolloff: Hard cutoff detected at {cutoff_hz:,.0f} Hz, strongly suggesting lossy perceptual encoding.")
-        if sharpness > 15.0:
+        # Cliff depth only counts below 93% of Nyquist — mastering-grade SRC brickwalls
+        # (e.g. 48k->44.1k conversion) legitimately live above that.
+        deep_cliff = cliff_depth > 35.0 and cutoff_hz < self.nyquist * 0.93
+        moderate_cliff = cliff_depth > 20.0 and cutoff_hz < self.nyquist * 0.93
+        if sharpness > 15.0 or deep_cliff:
             l_score += self.SCORE_SHARP_CLIFF_HARD
-            l_ev.append(f"Unnatural Spectral Cliff: Frequency drop-off is mathematically steep ({sharpness:.1f} dB/bin), typical of algorithmic low-pass filters.")
-        elif sharpness > 8.0:
+            l_ev.append(f"Unnatural Spectral Cliff: Spectrum falls {cliff_depth:.0f} dB across 800 Hz at the ceiling ({sharpness:.1f} dB/bin gradient) — an algorithmic low-pass wall.")
+        elif sharpness > 8.0 or moderate_cliff:
             l_score += self.SCORE_SHARP_CLIFF_SOFT
-            l_ev.append(f"Steep Frequency Ceiling: Substantial spectral cliff detected ({sharpness:.1f} dB/bin).")
+            l_ev.append(f"Steep Frequency Ceiling: Substantial spectral cliff detected ({cliff_depth:.0f} dB across 800 Hz, {sharpness:.1f} dB/bin).")
         if hf_ratio < 0.005:
             l_score += self.SCORE_HF_NEAR_ZERO
             l_ev.append(f"Energy Depletion: Insufficient high-frequency energy ratio ({hf_ratio:.4f}), often caused by acoustic masking compression.")
@@ -602,7 +1115,8 @@ class SpectralEngine:
 
         return l_score, l_ev, n_score, n_ev
 
-    def _verdict(self, net_score: int, cutoff_hz: float, dsd_detected: bool) -> tuple[str, str, list[str]]:
+    def _verdict(self, main_score: int, net_score: int, cutoff_hz: float, dsd_detected: bool,
+                 cassette: bool = False, vinyl: bool = False) -> tuple[str, str, list[str]]:
         caveats = [
             "Analog Origins: Vinyl and tape transfers naturally exhibit HF rolloff and higher noise floors; these are not suspicious traits.",
             "Modern Mastering: Audio engineers frequently apply gentle low-pass filters at 19-20 kHz to prevent aliasing distortion.",
@@ -616,44 +1130,158 @@ class SpectralEngine:
             sentence = f"ℹ Natively Lossy Format ({ext.upper()}){mp3_match}"
             if not mp3_match and net_score >= 6: sentence += " — severe degradation detected."
             return "CAUTION", sentence, []
+        if not _SCIPY_OK: caveats.append("scipy not installed — advanced DSP suite skipped; verdict relies on the base spectral engine only.")
         if dsd_detected: caveats.append("DSD transcode detected. Ultrasonic noise inflates entropy and HF scores.")
-        if net_score >= 6: return "SUSPICIOUS", "⚠  Spectral anomalies detected", caveats
-        elif net_score >= 3: return "CAUTION", "~  Minor spectral quirks — likely legitimate", caveats
-        elif net_score >= 1: return "LIKELY_GENUINE", "✓  Consistent with genuine lossless source", caveats
+        if cassette: caveats.append("Cassette source profile matched — HF limitations are analog tape physics, not codec damage.")
+        if vinyl: caveats.append("Vinyl surface noise detected — rolloff and noise floor traits are analog, not codec damage.")
+        if main_score >= 86: return "LIKELY_LOSSY", "✗  Lossy transcode detected — fake lossless (high certainty)", caveats
+        elif main_score >= 55: return "SUSPICIOUS", "⚠  Strong lossy indicators — probable transcode", caveats
+        elif main_score >= 31: return "CAUTION", "~  Minor spectral quirks — possibly legitimate", caveats
+        elif main_score >= 11: return "LIKELY_GENUINE", "✓  Consistent with genuine lossless source", caveats
         else: return "GENUINE", "✓  Strong evidence of authentic lossless source", caveats
 
     def analyse(self, max_seconds: Optional[float] = None) -> SpectralAnalysis:
         result = SpectralAnalysis()
+        result.scipy_available = _SCIPY_OK
         if not _NUMPY_OK:
             result.primary_verdict = "numpy not installed"; result.verdict_label = "INCONCLUSIVE"; return result
-        audio = self._decode_audio(max_seconds)
+        if not _SCIPY_OK:
+            print("Warning: scipy not installed — advanced forensic suite (auCDtect, vinyl/cassette, "
+                  "psychoacoustic tests) disabled. pip install scipy", file=sys.stderr)
+
+        # Single decode: stereo when available (mid feeds every mono detector, side feeds joint-stereo forensics)
+        audio, side = None, None
+        if self.channels >= 2 and (pair := self._decode_stereo(max_seconds)) is not None:
+            audio, side = pair
+        if audio is None:
+            audio = self._decode_audio(max_seconds)
         if audio is None or len(audio) < self.WINDOW * 2:
             result.primary_verdict = "Could not decode audio"; result.verdict_label = "INCONCLUSIVE"; return result
 
-        frames, bins = self._compute_frames(audio), self._freq_bins()
-        if frames.shape[0] < 4:
+        frames_all, phase_hi, _ = self._compute_stft(audio)
+        bins = self._freq_bins()
+        if frames_all.shape[0] < 4:
             result.primary_verdict = "File too short"; result.verdict_label = "INCONCLUSIVE"; return result
+
+        # Silent frames carry no spectral evidence — exclude them from all statistics
+        active = self._active_frame_mask(frames_all)
+        if int(active.sum()) >= 4:
+            frames, phase_act = frames_all[active], phase_hi[active]
+        else:
+            frames, phase_act = frames_all, phase_hi
 
         cutoffs_per_frame = self._cutoff_per_frame(frames, bins)
         cutoff_hz, cutoff_var = float(np.percentile(cutoffs_per_frame, 95)), float(np.var(cutoffs_per_frame))
+        cutoff_std = math.sqrt(cutoff_var)
         sharpness, hf_ratio = self._sharpness(frames, bins, cutoff_hz), self._hf_energy_ratio(frames, bins)
+        cliff_depth = self._cliff_depth(frames, bins, cutoff_hz)
         banding, nf_above = self._banding_score(frames, bins, cutoff_hz), self._noise_floor_above_cutoff(frames, bins, cutoff_hz)
         lpf_detected, lpf_s = self._lpf_scan(frames, bins)
         entropy, dsd_detected = self._spectral_entropy(frames), self._dsd_scan(frames, bins)
 
         side_anomaly = 0.0
-        if (stereo_pair := self._decode_stereo(max_seconds)) is not None:
-            side_anomaly = self._side_channel_anomaly(stereo_pair[0], stereo_pair[1], bins)
+        if side is not None:
+            side_anomaly = self._side_channel_anomaly(frames_all, side, bins)
 
-        lossy_score, lossy_ev, natural_score, natural_ev = self._score(cutoff_hz, cutoff_var, sharpness, hf_ratio, nf_above, banding, side_anomaly, entropy, dsd_detected)
+        lossy_score, lossy_ev, natural_score, natural_ev = self._score(cutoff_hz, cutoff_var, sharpness, cliff_depth, hf_ratio, nf_above, banding, side_anomaly, entropy, dsd_detected)
         net_score = max(0, lossy_score - natural_score)
-        label, sentence, caveats = self._verdict(net_score, cutoff_hz, dsd_detected)
+
+        # ------------------------------------------------------------------
+        # Advanced 11-rule forensic suite → unified Main Score (0–100)
+        # ------------------------------------------------------------------
+        main = round(net_score * 45 / self.MAX_LOSSY_SCORE)
+        cassette_detected, vinyl_detected = False, False
+        mp3_profile_match = any(abs(cutoff_hz - freq) <= 300 for freq in self.MP3_CUTOFFS.values()) and cutoff_hz < 20000
+
+        if _SCIPY_OK:
+            # Rule: Fakin' the Funk header integrity
+            decoded_dur = len(audio) / self.sample_rate if max_seconds is None else 0.0
+            dur_mm, br_mm, hdr_reasons = self._check_header_integrity(decoded_dur)
+            result.header_duration_mismatch, result.header_bitrate_mismatch = dur_mm, br_mm
+            if dur_mm: main += 20
+            if br_mm: main += 25
+            lossy_ev.extend(hdr_reasons)
+
+            # Rule: psychoacoustic artefacts (pre-echo / aliasing / MP3 subband comb)
+            psy_score, psy_ev, preecho, aliasing, mp3_noise = self._psychoacoustic_artifacts(audio, frames, bins, cutoff_hz, mp3_profile_match)
+            result.preecho_pct, result.aliasing_corr, result.mp3_noise_pattern_detected = preecho, aliasing, mp3_noise
+            main += psy_score
+            lossy_ev.extend(psy_ev)
+
+            # Rule 11: cassette source profiler (veto — analog tape, not codec damage)
+            cass_score, cass_ev = self._cassette_source(audio, cutoff_hz, cutoff_std, mp3_noise)
+            result.cassette_score = cass_score
+            cassette_detected = cass_score >= 30
+            if cassette_detected:
+                main -= 40
+                natural_ev.append(f"Cassette Source Profile matched (score {cass_score}): low cutoff is analog tape physics, not a codec wall.")
+                natural_ev.extend(cass_ev)
+
+            # Shared noise-floor measurement above the cutoff (FFT brickwall, computed once).
+            # Band needs >=400 Hz of room; cutoffs above 93% of Nyquist are mastering-SRC
+            # territory and excluded from void forensics.
+            noise_band, void_db = None, 0.0
+            band_lo, band_hi = cutoff_hz + 800.0, self.nyquist - 100.0
+            if 0 < cutoff_hz < self.nyquist * 0.93 and band_hi - band_lo >= 400.0:
+                cap = audio[: int(self.TIME_DOMAIN_CAP_S * self.sample_rate)]
+                noise_band = self._fft_band_extract(cap, band_lo, band_hi)
+                void_db = 20 * math.log10(float(np.sqrt(np.mean(noise_band ** 2))) + 1e-12)
+
+            # Rule: AFD PRO segment voting (skipped under cassette veto).
+            # Adaptive wall: a steep cliff (>30 dB) with a verified digital void above it
+            # IS a codec wall wherever it sits — track it instead of the fixed 16.5 kHz so
+            # high-cutoff encoders (LAME 320 walls at ~20.2 kHz) cannot slip past the vote.
+            # Natural fades have shallow cliffs and dark analog sources leave hiss, so
+            # neither can arm this.
+            wall_hz = 16500.0
+            if noise_band is not None and void_db < -85.0 and cliff_depth > 30.0:
+                wall_hz = max(wall_hz, cutoff_hz + 400.0)
+            seg_walled, seg_total, seg_fail = self._segment_voting(audio, wall_hz=wall_hz)
+            result.segment_walled, result.segment_total, result.segment_wall_hz = seg_walled, seg_total, wall_hz
+            if seg_fail and not cassette_detected:
+                main += 55
+                lossy_ev.append(f"Segment Vote FAILED: {seg_walled}/{seg_total} sampled 2s clips are frequency-walled at ≤{wall_hz / 1000:.1f} kHz — consistent whole-file lossy ancestry.")
+
+            # Rule: silence dither / vinyl noise / clicks (3-phase)
+            if cutoff_hz <= 21500 and not cassette_detected:
+                sil_score, sil_ev, sil_ratio, vinyl_detected, clicks = self._silence_and_vinyl(audio, cutoff_hz, noise_band=noise_band)
+                result.silence_ratio, result.vinyl_noise_detected, result.vinyl_clicks_per_min = sil_ratio, vinyl_detected, clicks
+                main += sil_score
+                (lossy_ev if sil_score > 0 else natural_ev).extend(sil_ev)
+
+            # Rule: auCDtect statistical bound frequency & high-band phase entropy
+            auc_avg, auc_prob, auc_phase = self._aucdtect_features(frames, phase_act, bins)
+            result.auc_avg_bound_freq, result.auc_prob_bound_freq, result.auc_phase_entropy = auc_avg, auc_prob, auc_phase
+            if self.sample_rate >= 40000 and 0 < auc_avg < 16500 and not cassette_detected and not vinyl_detected:
+                main += 25
+                lossy_ev.append(f"auCDtect Bound Collapse: spectral scatter dies at {auc_avg:,.0f} Hz on average — the statistical void of a lossy codec.")
+            if auc_phase > 4.5 and cutoff_hz < self.nyquist * 0.85:
+                main += 10
+                lossy_ev.append(f"High-Band Phase Disruption: phase-difference entropy {auc_phase:.2f} bits with a depressed cutoff — quantized HF phase relationships.")
+
+            # Rule: spectral sparsity (psychoacoustic bin-zeroing below the cutoff)
+            sparsity = self._spectral_sparsity(frames, bins, cutoff_hz)
+            result.spectral_sparsity = sparsity
+            if sparsity > 0.30 and cutoff_hz < self.nyquist * 0.95:
+                main += 10
+                lossy_ev.append(f"Psychoacoustic Holes: {sparsity * 100:.0f}% of bins below the cutoff are zeroed (<-95 dB) — codec bit-allocation footprint.")
+
+            # Rule: ultrasonic envelope correlation (anti-forensic noise-injection exposure)
+            ultra = self._ultrasonic_envelope_correlation(frames, bins)
+            result.hf_envelope_correlation = ultra
+            if ultra < 0.15 and 0 < auc_avg < cutoff_hz - 2000 and cutoff_hz > 16500:
+                main += 15
+                lossy_ev.append(f"Fake HF Noise Injection: ultrasonic band is statistically independent of the music (corr {ultra:.2f}) while organic scatter dies at {auc_avg:,.0f} Hz — noise pasted above a codec wall.")
+
+        main = max(0, min(100, main))
+        label, sentence, caveats = self._verdict(main, net_score, cutoff_hz, dsd_detected, cassette_detected, vinyl_detected)
 
         legit_cutoff = cutoff_hz > (self.nyquist * 0.85)
 
         result.cutoff_hz, result.cutoff_hz_str = cutoff_hz, f"{int(cutoff_hz):,} Hz"
         result.cutoff_variance, result.cutoff_variance_interp = cutoff_var, self._interp_variance(cutoff_var, legit_cutoff)
         result.cutoff_sharpness_db, result.cutoff_sharpness_interp = sharpness, self._interp_sharpness(sharpness)
+        result.cliff_depth_db = cliff_depth
         result.hf_energy_ratio, result.hf_energy_interp = hf_ratio, self._interp_hf_ratio(hf_ratio)
         result.banding_score, result.banding_interp = banding, self._interp_banding(banding)
         result.nf_above_cutoff_db, result.nf_interp = nf_above, self._interp_nf(nf_above)
@@ -662,7 +1290,12 @@ class SpectralEngine:
         result.lpf_detected, result.lpf_cutoff_str, result.dsd_detected = lpf_detected, lpf_s, dsd_detected
         result.lossy_score, result.natural_score, result.net_score, result.max_score = lossy_score, natural_score, net_score, self.MAX_LOSSY_SCORE
         result.raw_lossy_pct = min(100.0, lossy_score / self.MAX_LOSSY_SCORE * 100.0) if lossy_score > 0 else 0.0
-        result.net_confidence_pct = min(100.0, net_score / self.MAX_LOSSY_SCORE * 100.0) if net_score > 0 else 0.0
+        result.main_score = main
+        result.net_confidence_pct = float(main)
+        result.sparsity_interp = self._interp_sparsity(result.spectral_sparsity, legit_cutoff)
+        result.hf_env_corr_interp = self._interp_ultra_corr(result.hf_envelope_correlation)
+        result.auc_bound_interp = self._interp_bound(result.auc_avg_bound_freq)
+        result.auc_phase_interp = self._interp_phase_entropy(result.auc_phase_entropy, legit_cutoff)
         result.verdict_label, result.primary_verdict = label, sentence
         result.evidence, result.natural_evidence, result.caveats = lossy_ev, natural_ev, caveats
         return result
@@ -689,15 +1322,26 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
         channels = 2
     try: claimed_depth = int(tech.precision.replace("-bit", "").strip())
     except ValueError: claimed_depth = 0
+    try: claimed_bitrate = int(re.sub(r"[^\d]", "", tech.bit_rate) or 0)
+    except ValueError: claimed_bitrate = 0
 
     auth = AuthenticityReport()
-    engine = SpectralEngine(filepath, sample_rate)
+    engine = SpectralEngine(filepath, sample_rate, channels=channels,
+                            claimed_duration=tech.duration_sec, claimed_bitrate_kbps=claimed_bitrate)
     auth.spectral = engine.analyse(max_seconds=fast_secs)
 
     auth.spectral_cutoff_hz = auth.spectral.cutoff_hz_str
     auth.spectral_cutoff_verdict = auth.spectral.primary_verdict
     auth.lpf_detected = auth.spectral.lpf_detected
     auth.lpf_cutoff_hz = auth.spectral.lpf_cutoff_str
+    auth.cassette_rip_detected = auth.spectral.cassette_score >= 30
+    auth.vinyl_rip_detected = auth.spectral.vinyl_noise_detected
+    auth.side_channel_analysis = f"{auth.spectral.side_anomaly_score:.3f} {auth.spectral.side_interp}" if channels >= 2 else "mono — no side channel"
+    if auth.spectral.header_duration_mismatch or auth.spectral.header_bitrate_mismatch:
+        kinds = [k for k, f in (("duration", auth.spectral.header_duration_mismatch), ("bitrate", auth.spectral.header_bitrate_mismatch)) if f]
+        auth.header_integrity = f"⚠ Header {' & '.join(kinds)} mismatch — forged or truncated stream"
+    elif auth.spectral.scipy_available and auth.spectral.verdict_label != "INCONCLUSIVE":
+        auth.header_integrity = "✓ Container header matches decoded stream"
     auth.bit_depth_authentic = check_bit_depth_authenticity(filepath, claimed_depth)
     auth.phase_correlation, auth.phase_verdict = measure_phase_correlation(filepath, channels)
     auth.clipped_samples, auth.clipping_verdict = detect_clipping(filepath)
@@ -769,6 +1413,48 @@ def _crest_colour(db: str) -> str:
 def _flat_colour(v: str) -> str:
     try: return C.GREEN if float(v) == 0 else (C.YELLOW if float(v) <= 1 else C.RED)
     except ValueError: return C.WHITE
+
+def _main_score_colour(score: int) -> str:
+    if score >= 86: return C.RED
+    if score >= 55: return C.ORANGE
+    if score >= 31: return C.YELLOW
+    return C.GREEN
+
+def _bound_colour(hz: float, nyquist_hint: float = 22050.0) -> str:
+    if hz <= 0: return C.WHITE
+    if hz >= min(18500.0, nyquist_hint * 0.85): return C.GREEN
+    if hz >= 16500: return C.YELLOW
+    return C.RED
+
+def _phase_ent_colour(e: float) -> str:
+    if e <= 0: return C.WHITE
+    return C.GREEN if e < 4.5 else C.YELLOW
+
+def _sparsity_colour(s: float) -> str:
+    if s < 0.05: return C.GREEN
+    if s < 0.30: return C.WHITE
+    return C.ORANGE
+
+def _ultra_corr_colour(c: float) -> str:
+    if c > 0.3: return C.GREEN
+    if c > 0.15: return C.WHITE
+    return C.YELLOW
+
+def _preecho_colour(p: float) -> str:
+    if p < 5: return C.GREEN
+    if p <= 10: return C.YELLOW
+    return C.ORANGE
+
+def _aliasing_colour(a: float) -> str:
+    if a < 0.3: return C.GREEN
+    if a <= 0.5: return C.YELLOW
+    return C.ORANGE
+
+def _silence_ratio_colour(r: float) -> str:
+    if r < 0: return C.GREY
+    if r < 0.15: return C.GREEN
+    if r <= 0.3: return C.YELLOW
+    return C.RED
 
 def _sox_entropy_colour(v: str) -> str:
     try:
@@ -878,14 +1564,14 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
         verdict_col  = {"GENUINE": C.GREEN, "LIKELY_GENUINE":C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE, "LIKELY_LOSSY": C.RED}.get(sp.verdict_label, C.WHITE)
         conf_bar = _c(verdict_col, "█" * conf_filled) + _c(C.GREY, "░" * conf_empty)
         print(f"  {conf_bar} {_c(verdict_col + C.BOLD, sp.primary_verdict)}")
-        print(f"  {_c(C.GREY, f'Raw Error Rate: {sp.raw_lossy_pct:.1f}%  |  Net Verdict Certainty: {sp.net_confidence_pct:.1f}%')}")
-        print(f"  {_c(C.GREY, f'Score: Lossy {sp.lossy_score} − Natural {sp.natural_score} = Net {sp.net_score}/{sp.max_score}')}")
+        print(f"  {_c(_main_score_colour(sp.main_score), f'Main Score: {sp.main_score}/100')}  {_c(C.GREY, '(0 = pristine lossless · 100 = certain transcode)')}")
+        print(f"  {_c(C.GREY, f'Base engine: Lossy {sp.lossy_score} − Natural {sp.natural_score} = Net {sp.net_score}/{sp.max_score}  |  Raw Error Rate: {sp.raw_lossy_pct:.1f}%')}")
         print()
         rows_spec = [
             _kv("Ultrasonic Noise", _c(C.ORANGE, "⚠ DSD/SACD Transcode Profile") if sp.dsd_detected else _c(C.GREEN, "✓ Normal")),
             _kv("HF Cutoff",         sp.cutoff_hz_str),
             _kv("Cutoff Variance",   f"{sp.cutoff_variance:.1f} Hz²  " + _c(C.GREY, sp.cutoff_variance_interp)),
-            _kv("Cliff Sharpness",   f"{sp.cutoff_sharpness_db:.1f} dB/bin  " + _c(C.GREY, sp.cutoff_sharpness_interp)),
+            _kv("Cliff Sharpness",   f"{sp.cutoff_sharpness_db:.1f} dB/bin · {sp.cliff_depth_db:.0f} dB drop/800Hz  " + _c(C.GREY, sp.cutoff_sharpness_interp)),
             _kv("HF Energy Ratio",   f"{sp.hf_energy_ratio:.5f}  " + _c(C.GREY, sp.hf_energy_interp)),
             _kv("Side Anomaly",      f"{sp.side_anomaly_score:.3f}  " + _c(C.GREY, sp.side_interp)),
             _kv("Banding Score",     f"{sp.banding_score:.3f}  " + _c(C.GREY, sp.banding_interp)),
@@ -895,6 +1581,42 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
         ]
         for row in rows_spec:
             if row: print(row)
+
+        print(_subsection("Advanced DSP Forensics  (scipy suite)"))
+        if sp.scipy_available:
+            if sp.segment_walled < 0: seg_val = _c(C.GREY, "n/a — file too short for 7-segment voting")
+            else:
+                seg_majority = sp.segment_walled > sp.segment_total / 2
+                seg_col = C.RED if seg_majority else (C.YELLOW if sp.segment_walled > 0 else C.GREEN)
+                seg_state = "✗ FAILED" if seg_majority else ("~ partial walls" if sp.segment_walled > 0 else "✓ passed")
+                seg_val = _c(seg_col, f"{seg_state} — {sp.segment_walled}/{sp.segment_total} clips walled ≤{sp.segment_wall_hz / 1000:.1f} kHz")
+            if sp.silence_ratio < 0: sil_val = _c(C.GREY, "n/a — no silent passages ≥ 0.5s found")
+            else: sil_val = _c(_silence_ratio_colour(sp.silence_ratio), f"{sp.silence_ratio:.3f}") + "  " + _c(C.GREY, "[<0.15 clean · >0.3 codec hash in silence]")
+            if sp.vinyl_noise_detected: vinyl_val = _c(C.BLUE, f"✓ surface noise detected ({sp.vinyl_clicks_per_min:.0f} clicks/min)")
+            else: vinyl_val = _c(C.GREY, "not detected")
+            if sp.cassette_score >= 30: cass_val = _c(C.BLUE, f"✓ tape profile matched (score {sp.cassette_score}/80)")
+            elif sp.cassette_score > 0: cass_val = _c(C.GREY, f"weak match (score {sp.cassette_score}/80)")
+            else: cass_val = _c(C.GREY, "not detected")
+            hdr_mm = sp.header_duration_mismatch or sp.header_bitrate_mismatch
+            rows_adv = [
+                _kv("Header Integrity", _c(C.RED, "⚠ header/stream mismatch — forged or truncated") if hdr_mm else _c(C.GREEN, "✓ container matches decoded stream")),
+                _kv("Segment Vote", seg_val),
+                _kv("auCDtect Bound", _c(_bound_colour(sp.auc_avg_bound_freq), f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode") + "  " + _c(C.GREY, sp.auc_bound_interp)),
+                _kv("HF Phase Entropy", _c(_phase_ent_colour(sp.auc_phase_entropy), f"{sp.auc_phase_entropy:.2f} bits") + "  " + _c(C.GREY, sp.auc_phase_interp)),
+                _kv("Spectral Sparsity", _c(_sparsity_colour(sp.spectral_sparsity), f"{sp.spectral_sparsity:.3f}") + "  " + _c(C.GREY, sp.sparsity_interp)),
+                _kv("Ultrasonic Corr.", _c(_ultra_corr_colour(sp.hf_envelope_correlation), f"{sp.hf_envelope_correlation:+.2f}") + "  " + _c(C.GREY, sp.hf_env_corr_interp)),
+                _kv("Pre-Echo", _c(_preecho_colour(sp.preecho_pct), f"{sp.preecho_pct:.1f}% of transients") + "  " + _c(C.GREY, "[MDCT block smearing]")),
+                _kv("HF Aliasing Corr.", _c(_aliasing_colour(sp.aliasing_corr), f"{sp.aliasing_corr:.2f}") + "  " + _c(C.GREY, "[codec filterbank mirroring]")),
+                _kv("MP3 Subband Comb", _c(C.ORANGE, "⚠ 689 Hz comb structure detected") if sp.mp3_noise_pattern_detected else _c(C.GREEN, "✓ none")),
+                _kv("Silence Dither", sil_val),
+                _kv("Vinyl Source", vinyl_val),
+                _kv("Cassette Source", cass_val),
+            ]
+            for row in rows_adv:
+                if row: print(row)
+        else:
+            print(f"  {_c(C.YELLOW, '⚠ scipy not installed — advanced forensic suite skipped (pip install scipy)')}")
+
         if sp.evidence:
             print(f"\n  {_c(C.DIM + C.ORANGE, 'Lossy indicators')}")
             for e in sp.evidence: print(f"    {_c(C.GREY, '·')} {_c(C.WHITE, e)}")
@@ -909,7 +1631,10 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
             if row: print(row)
 
     print(_subsection("Source Integrity"))
-    for row in [_kv("Bit-Depth Auth", auth.bit_depth_authentic), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
+    source_flags = []
+    if auth.cassette_rip_detected: source_flags.append("cassette tape")
+    if auth.vinyl_rip_detected: source_flags.append("vinyl")
+    for row in [_kv("Bit-Depth Auth", auth.bit_depth_authentic), _kv("Header Integrity", auth.header_integrity), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
         if row: print(row)
     if auth.silence_sections:
         for s in auth.silence_sections[:4]: print(f"    {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")

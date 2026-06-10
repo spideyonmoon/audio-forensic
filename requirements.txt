@@ -1,5 +1,9 @@
-# Core dependency (optional but recommended for spectral analysis)
+# Core dependencies (optional but strongly recommended)
+# numpy — base spectral engine (FFT cutoff/banding/entropy analysis)
+# scipy — advanced forensic suite (auCDtect bound frequency, vinyl/cassette
+#         profiling, pre-echo/aliasing tests, segment voting filters)
 numpy>=1.21.0
+scipy>=1.9.0
 
 # Required external tools (must be installed separately)
 # ffmpeg  - Audio decoding and analysis
