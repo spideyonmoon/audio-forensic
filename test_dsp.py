@@ -236,13 +236,18 @@ check("near-Nyquist cutoff -> no fingerprint", eng._codec_fingerprint(21800) is 
 print("\n== 16. Spliced/partial transcode segmentation ==")
 spliced = np.concatenate([noise(15.0), brickwall(noise(15.0), 16800)])
 w_sp, t_sp, fake_sp, segs_sp = eng._segment_voting(spliced)
-anom = [(t, c, cl) for t, c, cl in segs_sp if 0 < c < 0.85 * (SR / 2) and cl > 25.0]
+anom = [(t, c, cl) for t, c, cl, _, _ in segs_sp if 0 < c < 0.85 * (SR / 2) and cl > 25.0]
 check("spliced file: no majority vote (walls above 16.5k)", not fake_sp, f"{w_sp}/{t_sp} walled")
 check("spliced file: >=2 anomalous walled clips found", len(anom) >= 2, f"{len(anom)} anomalous")
 check("anomalous clips sit in the transcoded half", all(t >= 14.0 for t, _, _ in anom),
       f"offsets {[f'{t:.1f}s' for t, _, _ in anom]}")
+void_anom = [t for t, c, _, vr, pk in segs_sp if 0 < c < 0.85 * (SR / 2) and vr < -110.0 and pk > -40.0]
+check("walled clips expose a digital void above the wall", len(void_anom) >= 2 and all(t >= 14.0 for t in void_anom),
+      f"{len(void_anom)} void clips")
 w_g, t_g, fake_g, segs_g = eng._segment_voting(noise(30.0))
-check("genuine: full-band clips, no cliffs", all(c > 21000 and cl < 25.0 for _, c, cl in segs_g))
+check("genuine: full-band clips, no cliffs", all(c > 21000 and cl < 25.0 for _, c, cl, _, _ in segs_g))
+check("genuine clips show no void", all(vr > -105.0 for *_, vr, _ in segs_g),
+      f"min void {min(vr for *_, vr, _ in segs_g):.0f} dB")
 
 mute = noise(30.0)
 mute[int(6.5 * SR):int(9.5 * SR)] = 0.0

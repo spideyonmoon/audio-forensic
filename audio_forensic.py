@@ -161,6 +161,7 @@ class AudioTechnical:
     bit_rate: str = ""; channels: str = ""; precision: str = ""; sample_rate: str = ""
     sample_encoding: str = ""; duration: str = ""; duration_sec: float = 0.0
     writing_library: str = ""; format_profile: str = ""; compression_mode: str = ""
+    codec: str = ""   # raw mediainfo Format of the audio stream (container-independent)
 
 @dataclass
 class LoudnessProfile:
@@ -223,6 +224,7 @@ class AuthenticityReport:
     rg_stored: str = ""; rg_measured_lufs: str = ""; rg_delta: str = ""; rg_verdict: str = ""
     cassette_rip_detected: bool = False
     vinyl_rip_detected: bool = False
+    mqa_detected: bool = False
     side_channel_analysis: str = ""
     header_integrity: str = ""
     encoder_trace: str = ""
@@ -302,6 +304,7 @@ def extract_mediainfo(filepath: Path) -> tuple[AudioTags, AudioTechnical]:
             tech.channels = track.get("Channels", "")
             tech.precision = f"{bit_depth}-bit" if bit_depth else ""
             tech.sample_rate = track.get("SamplingRate", "")
+            tech.codec = fmt
             tech.sample_encoding = f"{bit_depth}-bit {fmt}" if bit_depth else fmt
             tech.writing_library = track.get("Encoded_Library__String", track.get("Encoded_Library", ""))
             tech.format_profile = track.get("Format_Profile", "")
@@ -326,7 +329,43 @@ def detect_encoder_trace(tags: AudioTags, tech: AudioTechnical, filepath: Path) 
     if not hits: return ""
     return f"⚠ Lossy encoder fingerprint in metadata: {', '.join(hits)} — tags survived a transcode"
 
-_SOX_UNSUPPORTED = {".m4a", ".mp4", ".aac", ".ogg", ".opus", ".wma", ".ape", ".mp3"}
+_MQA_MAGIC = 0xbe0498c88  # 36-bit MQA sync word (reverse-engineered, MQA_identifier project)
+
+def detect_mqa(tags: AudioTags, tech: AudioTechnical, filepath: Path) -> str:
+    """MQA folds 'hi-res' data into the LSBs as pseudo-noise dither — spectrally
+    invisible to PCM forensics (the stream verifies as ordinary 16/44.1 lossless).
+    Two layers: metadata traces (fast), then the signal itself — MQA carries a
+    control stream in (L XOR R) at bit position (depth−16) that begins with a
+    36-bit sync word. Tag-stripping can't remove that."""
+    hay = " ".join([tech.writing_library, tech.format_profile, tags.comments,
+                    *tags.other.keys(), *tags.other.values()]).lower()
+    found = "metadata tags" if "mqa" in hay else ""
+
+    depth = 0
+    try: depth = int(tech.precision.replace("-bit", "").strip())
+    except ValueError: pass
+    if not found and _NUMPY_OK and depth in (16, 24) and tech.channels.strip() == "2":
+        # First 4 s, bit-exact stereo decode (s32le: sample sits in the top bits)
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(filepath), "-vn", "-t", "4",
+                            "-ac", "2", "-c:a", "pcm_s32le", "-f", "s32le", "pipe:1"],
+                           capture_output=True, check=False)
+        if r.returncode == 0 and len(r.stdout) >= 8 * 4096:
+            arr = np.frombuffer(r.stdout[: len(r.stdout) // 8 * 8], dtype=np.int32).reshape(-1, 2)
+            x = np.bitwise_xor(arr[:, 0], arr[:, 1]).view(np.uint32) >> np.uint32(32 - depth)
+            weights = 2.0 ** np.arange(35, -1, -1)  # rolling 36-bit window, MSB first
+            for pos in (depth - 16, depth - 15, depth - 14):
+                bits = ((x >> np.uint32(pos)) & 1).astype(np.float64)
+                if len(bits) < 36: break
+                vals = np.lib.stride_tricks.sliding_window_view(bits, 36) @ weights
+                if np.any(vals == float(_MQA_MAGIC)):
+                    found = f"sync word in the bitstream (bit {pos})"
+                    break
+    if not found: return ""
+    return (f"MQA-encoded stream (detected via {found}) — high-frequency content is "
+            "origami-folded into the low-order bits as pseudo-noise. Spectral forensics see "
+            "only the PCM core; the folded payload (and its lossy unfold) cannot be verified.")
+
+_SOX_UNSUPPORTED = {".m4a", ".mp4", ".aac", ".ogg", ".opus", ".wma", ".ape", ".mp3", ".dff", ".dsf"}
 
 def extract_sox_stats(filepath: Path) -> dict[str, str]:
     if filepath.suffix.lower() in _SOX_UNSUPPORTED:
@@ -522,7 +561,7 @@ def audit_replaygain(tags: AudioTags, lufs_integrated: str) -> tuple[str, str, s
     except (ValueError, IndexError): return stored_raw, lufs_integrated, "", ""
 
 
-def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Path:
+def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Optional[Path]:
     """Generates a clean mono spectrogram (SoX rendering — best visual quality).
 
     The decoded mono WAV is piped from ffmpeg straight into SoX's stdin: no temp
@@ -566,7 +605,9 @@ def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Path:
         "-lavfi", "showspectrumpic=s=1280x512:mode=combined:color=fiery:legend=1",
         str(output)
     ])
-    return output
+    # Both renderers can fail (corrupt input, unreadable codec) — report that honestly
+    # instead of printing a ✓ with a path to a file that was never written.
+    return output if output.exists() else None
 
 # ---------------------------------------------------------------------------
 # Advanced DSP helpers (scipy-backed; engine degrades gracefully without them)
@@ -644,16 +685,32 @@ class SpectralEngine:
     # audio never has features (checked lowest-first so the true origin wins).
     RESAMPLE_SOURCE_RATES = (44100, 48000, 88200, 96000)
 
+    # Codecs that are lossy regardless of container — the .m4a/.mka/.ogg extension says
+    # nothing (M4A carries lossy AAC *or* lossless ALAC). mediainfo's Format field does.
+    LOSSY_CODECS = {"AAC", "MP3", "MPEG AUDIO", "OPUS", "VORBIS", "WMA", "AC-3",
+                    "E-AC-3", "MUSEPACK", "MPC", "ATRAC", "ATRAC3"}
+
+    # Frequencies ≥ this are outside any measured codec lowpass (highest wall: Opus CELT
+    # 20,460 Hz; highest foreign Nyquist of a Redbook fake: 22,050 Hz). Walls ABOVE it are
+    # DSD→PCM decimation filters (~24–50 kHz) or ultrasonic mastering filters on genuine
+    # hi-res — penalising those was the report's false-positive cluster on 96k/192k masters.
+    CODEC_CEILING_HZ = 22500.0
+
     # Time-domain analyses (Hilbert envelopes, cascaded band filters) are capped to
     # this many seconds to bound CPU/RAM on very long files; spectral stats use the full decode.
     TIME_DOMAIN_CAP_S = 180.0
 
     def __init__(self, filepath: Path, sample_rate: int, channels: int = 2,
-                 claimed_duration: float = 0.0, claimed_bitrate_kbps: int = 0):
+                 claimed_duration: float = 0.0, claimed_bitrate_kbps: int = 0,
+                 codec: str = ""):
         self.filepath = filepath; self.sample_rate = sample_rate; self.nyquist = sample_rate / 2.0
         self.channels = channels
         self.claimed_duration = claimed_duration
         self.claimed_bitrate_kbps = claimed_bitrate_kbps
+        self.codec = codec.upper().strip()
+        # Native 1-bit DSD: ffmpeg decodes it through a decimation filter whose ~24-50 kHz
+        # wall is conversion physics, not a lossy codec — wall forensics don't apply.
+        self.native_dsd = self.codec.startswith("DSD") or filepath.suffix.lower() in {".dff", ".dsf"}
         self.audio_mid: "np.ndarray | None" = None
         self.audio_side: "np.ndarray | None" = None
         # Forward-rfft cache for _fft_band_extract: several detectors band-slice the
@@ -952,11 +1009,15 @@ class SpectralEngine:
     # -----------------------------------------------------------------------
     # Audio Fake Detector PRO — N-segment wall-check voting
     # -----------------------------------------------------------------------
-    def _segment_voting(self, audio: "np.ndarray", n_segments: int = 9, wall_hz: float = 16500.0) -> "tuple[int, int, bool, list[tuple[float, float, float]]]":
+    def _segment_voting(self, audio: "np.ndarray", n_segments: int = 9, wall_hz: float = 16500.0) -> "tuple[int, int, bool, list[tuple[float, float, float, float, float]]]":
         """Cutoff-walls N spread-out 2 s clips and takes a majority vote.
         Returns (walled, valid_total, is_fake, segments) where segments holds
-        (offset_seconds, cutoff_hz, cliff_db) per non-silent clip — the per-clip data
-        feeds spliced/partial-transcode detection in analyse().
+        (offset_seconds, cutoff_hz, cliff_db, void_rel_db, peak_db) per non-silent
+        clip — the per-clip data feeds spliced/partial-transcode detection in analyse().
+        void_rel_db is the 18.5 kHz→Nyquist band RMS relative to the clip's spectral
+        peak: a lossy span decodes to digital zero up there (≈−120 dB) while genuine
+        content can never drop below its own dither floor (16-bit ≈ −102 dB) — this
+        catches spliced transcodes even when the passage is too dark to show a cliff.
         Silent clips are skipped (their cutoff reads as 0 and would poison the vote).
         wall_hz is adaptive: when the global cutoff has a verified digital void above it
         (or sits on a measured codec wall), the threshold tracks that cutoff instead of
@@ -980,11 +1041,14 @@ class SpectralEngine:
         win = np.hanning(seg_samples)
         freqs = np.fft.rfftfreq(seg_samples, 1.0 / self.sample_rate)
         bin_hz = freqs[1]
+        hi_sel = (freqs >= 18500.0) & (freqs <= self.nyquist - 500.0)
         silent_peak = 10 ** (-50.0 / 20.0)
         for off in offsets:
             clip = audio[off : off + seg_samples].astype(np.float64)
-            if float(np.max(np.abs(clip))) < silent_peak:
+            clip_peak = float(np.max(np.abs(clip)))
+            if clip_peak < silent_peak:
                 continue
+            peak_db = 20 * math.log10(clip_peak)
             mag = np.abs(np.fft.rfft(clip * win))
             ref = mag.max() + 1e-12
             db = 20 * np.log10(mag / ref + 1e-12)
@@ -997,9 +1061,12 @@ class SpectralEngine:
             hi_a, hi_b = int((cutoff + 350) / bin_hz), int((cutoff + 450) / bin_hz)
             if lo_a > 0 and hi_b < len(db) and lo_b > lo_a and hi_b > hi_a:
                 cliff = float(db[lo_a:lo_b].mean() - db[hi_a:hi_b].mean())
+            void_rel = 0.0
+            if hi_sel.any():
+                void_rel = float(20 * np.log10(np.sqrt(np.mean((mag[hi_sel] / ref) ** 2)) + 1e-15))
             if cutoff <= wall_hz:
                 walled += 1
-            segments.append((off / self.sample_rate, cutoff, cliff))
+            segments.append((off / self.sample_rate, cutoff, cliff, void_rel, peak_db))
 
         valid = len(segments)
         if valid == 0: return -1, 0, False, []
@@ -1043,7 +1110,8 @@ class SpectralEngine:
     # -----------------------------------------------------------------------
     # 3-Phase silence / dither / vinyl-surface-noise analyser
     # -----------------------------------------------------------------------
-    def _silence_and_vinyl(self, audio: "np.ndarray", cutoff_hz: float, noise_band: "np.ndarray | None" = None) -> tuple[int, list[str], float, bool, float]:
+    def _silence_and_vinyl(self, audio: "np.ndarray", cutoff_hz: float, noise_band: "np.ndarray | None" = None,
+                           cliff_db: float = 999.0) -> tuple[int, list[str], float, bool, float]:
         """Phase 1: dither energy ratio inside silent passages (codec noise vs clean dither).
         Phase 2: noise floor character above the cutoff (vinyl hiss is random & stable).
         Phase 3: click/pop transient counting to confirm a vinyl source."""
@@ -1079,7 +1147,13 @@ class SpectralEngine:
                 return float(np.sum(fft_res[idx]) / len(segment) ** 2) if np.any(idx) else 0.0
 
             e_music, e_silence = hf_energy(music_ref), hf_energy(silence_ref)
-            if e_music > 0:
+            # The ratio is only meaningful when the music actually CARRIES ultrasonic
+            # energy. On dark/acoustic masters (e.g. a 1970 recording) e_music ≈ 0, so
+            # tape hiss in the quiet passages balloons the ratio and convicts a genuine
+            # file. Require an absolute HF level in the music reference first.
+            # hf_energy ≈ 0.1875 × (band RMS)² (hanning Σw² = 0.375N, one-sided ÷2),
+            # so 1.2e-8 ≈ a −72 dBFS RMS floor across the 16 kHz+ band.
+            if e_music > 1.2e-8:
                 silence_ratio = e_silence / (e_music + 1e-12)
                 if silence_ratio > 0.3:
                     score += 50
@@ -1101,10 +1175,20 @@ class SpectralEngine:
             rms = float(np.sqrt(np.mean(noise_band ** 2)))
             energy_db = 20 * math.log10(rms + 1e-12)
             if energy_db < -70.0:
-                score += 20
-                reasons.append(f"Digital Upscale Suspect: no noise floor above the cutoff ({energy_db:.1f} dB) — analog sources always leave hiss there.")
+                # Two gates before convicting on a void. (1) Codec territory only — a
+                # clean void above a 30-48 kHz ultrasonic mastering filter is NORMAL on
+                # genuine hi-res masters. (2) The cutoff must be a WALL (>25 dB cliff):
+                # a gentle 20-22 kHz mastering rolloff into digital silence is studio
+                # practice, not an upscale; codec/SRC walls always fall hard. Both were
+                # +20 false-positive modes on the report's genuine 24/96 web releases.
+                if cutoff_hz < self.CODEC_CEILING_HZ and cliff_db > 25.0:
+                    score += 20
+                    reasons.append(f"Digital Upscale Suspect: no noise floor above the cutoff ({energy_db:.1f} dB) under a {cliff_db:.0f} dB wall — analog sources always leave hiss there.")
             else:
-                autocorr = calculate_autocorrelation(noise_band, lag=50)
+                # Lag expresses a physical time offset (~1.13 ms at 44.1k) — keep that
+                # time constant at hi-res rates or vinyl hiss at 96/192 kHz reads as
+                # correlated and the analog veto never fires.
+                autocorr = calculate_autocorrelation(noise_band, lag=max(25, round(50 * sr / 44100)))
                 variance = calculate_temporal_variance(noise_band, sr)
                 if autocorr < 0.3 and variance < 5.0:
                     vinyl_detected = True
@@ -1225,7 +1309,7 @@ class SpectralEngine:
         if upper_limit > noise_lo:
             noise_sig = self._fft_band_extract(cap, noise_lo, upper_limit)
             noise_db = 20 * math.log10(float(np.std(noise_sig)) + 1e-12)
-            autocorr = calculate_autocorrelation(noise_sig, lag=100)
+            autocorr = calculate_autocorrelation(noise_sig, lag=max(50, round(100 * sr / 44100)))
             if noise_db > -55.0 and autocorr < 0.2:
                 score += 30
                 hiss_found = True
@@ -1483,12 +1567,24 @@ class SpectralEngine:
                  fake_hires: str = "") -> tuple[str, str, list[str]]:
         caveats = list(_GENERIC_CONTEXT_NOTES)
         ext = self.filepath.suffix.lower()
-        if ext in {".mp3", ".aac", ".ogg", ".opus", ".wma"}:
+        # Native lossy is decided by the CODEC, not the extension — .m4a carries lossy
+        # AAC or lossless ALAC, and Opus hides in .m4a/.mka too (the report's bypass).
+        if self.codec in self.LOSSY_CODECS or ext in {".mp3", ".aac", ".ogg", ".opus", ".wma"}:
+            fmt_label = self.codec if len(self.codec) <= 3 else self.codec.title()
+            if not fmt_label: fmt_label = ext.upper().lstrip(".")
+            elif f".{self.codec.lower()}" != ext:
+                fmt_label += f" in {ext.upper()}"
             fp = self._codec_fingerprint(cutoff_hz)
+            # The codec is KNOWN here — a nearest-wall match from a different codec
+            # (e.g. an Opus cutoff brushing the LAME 320 wall) is noise, not signal.
+            if fp and self.codec and self.codec not in fp[0].upper(): fp = None
             fp_match = f" — matches measured {fp[0]} {fp[1]} encoder profile" if fp else ""
-            sentence = f"ℹ Natively Lossy Format ({ext.upper()}){fp_match}"
+            sentence = f"ℹ Natively Lossy Format ({fmt_label}){fp_match}"
             if not fp_match and net_score >= 6: sentence += " — severe degradation detected."
             return "CAUTION", sentence, []
+        if self.native_dsd:
+            caveats.append("Native DSD (1-bit) stream — the analysed PCM came through a DSD decimation filter; its ~24–50 kHz wall and shaped ultrasonic noise are conversion physics, not codec damage.")
+            return "GENUINE", "ℹ Native DSD source — PCM-domain transcode forensics do not apply to the 1-bit stream", caveats
         if not _SCIPY_OK: caveats.append("scipy not installed — advanced DSP suite skipped; verdict relies on the base spectral engine only.")
         if dsd_detected: caveats.append("DSD transcode detected. Ultrasonic noise inflates entropy and HF scores.")
         if cassette: caveats.append("Cassette source profile matched — HF limitations are analog tape physics, not codec damage.")
@@ -1627,7 +1723,7 @@ class SpectralEngine:
             # hi-res carries content/noise well past 24 kHz; a 20 kHz ceiling in a 96k
             # file is counterfeit. Gated hard (hi-res rate + cutoff <60% Nyquist + steep
             # cliff + digital void) so dark analog masters and gentle LPFs never trip it.
-            if not resample_hit and self._is_fake_hires_bandwidth(
+            if not resample_hit and not self.native_dsd and self._is_fake_hires_bandwidth(
                     self.sample_rate, self.nyquist, cutoff_hz, cliff_depth, void_db, noise_band is not None):
                 main += 20
                 result.fake_hires = f"{self.sample_rate / 1000:g} kHz container but bandwidth ends at {cutoff_hz / 1000:.1f} kHz"
@@ -1650,9 +1746,18 @@ class SpectralEngine:
             # codec wall — arming the vote on it would mislabel a lossless upsample
             # as "whole-file lossy ancestry" (the resample rule already scored it).
             wall_is_resample = resample_hit is not None and resample_hit[1] == "wall"
-            if cliff_depth > 30.0 and (void_verified or fingerprint) and not wall_is_resample:
+            # Ceiling gate: only codec-territory walls (<22.5 kHz) may arm the adaptive
+            # vote. DSD decimation filters (~24-50 kHz) and steep ultrasonic mastering
+            # filters on genuine hi-res sit above it — both are walls with voids, and
+            # arming on them convicts genuine files (the DSD64 false LIKELY_LOSSY).
+            if (cliff_depth > 30.0 and (void_verified or fingerprint)
+                    and not wall_is_resample and cutoff_hz < self.CODEC_CEILING_HZ):
                 wall_hz = max(wall_hz, cutoff_hz + 400.0)
-            seg_walled, seg_total, seg_fail, seg_data = self._segment_voting(audio, wall_hz=wall_hz)
+            # Probe density adapts to duration (one probe ≈ every 15 s, 9-36 probes):
+            # 9 fixed probes on a 5-minute track stride ~38 s and step right over a
+            # 30 s spliced transcode (the report's spliced_mp3 miss).
+            n_seg = int(min(36, max(9, (len(audio) / self.sample_rate) // 15)))
+            seg_walled, seg_total, seg_fail, seg_data = self._segment_voting(audio, n_segments=n_seg, wall_hz=wall_hz)
             result.segment_walled, result.segment_total, result.segment_wall_hz = seg_walled, seg_total, wall_hz
             if seg_fail and not cassette_detected:
                 main += 55
@@ -1663,26 +1768,56 @@ class SpectralEngine:
                 # of the file is clean. The cliff requirement keeps naturally dark or
                 # quiet passages (gradual fades, no wall) out.
                 anomaly_ceiling = min(cutoff_hz - 2000.0, self.nyquist * 0.85)
-                anomalous = [(t, c, cl) for t, c, cl in seg_data if 0 < c < anomaly_ceiling and cl > 25.0]
+                # Two independent views of a spliced lossy span:
+                #  - cliff: the clip's spectrum ends in a >25 dB wall (loud transcoded music);
+                #  - void:  the clip's 18.5k+ band is ≥110 dB below its own peak while music
+                #    plays. Nothing genuine does that — 16-bit dither alone sits ~−102 dB rel
+                #    (measured: spliced MP3 clips −120, genuine quiet fades −95..−102). This
+                #    catches splices whose passages are too dark for the wall to show.
+                #    Gated on a full-band global spectrum so an honest lowpassed master
+                #    (every clip "voided") can't trip it, and on clip peak > −40 dBFS so
+                #    fade-outs into dithered noise floor don't count.
+                full_band_global = cutoff_hz > self.nyquist * 0.93
+                anom = {}
+                for t, c, cl, vr, pk in seg_data:
+                    is_cliff = 0 < c < anomaly_ceiling and cl > 25.0
+                    is_void = (full_band_global and 11000.0 < c < anomaly_ceiling
+                               and vr < -110.0 and pk > -40.0)
+                    if is_cliff or is_void:
+                        anom[t] = (t, c, cl, vr, "void" if is_void else "cliff")
+                anomalous = sorted(anom.values())
+                void_backed = any(kind == "void" for *_, kind in anomalous)
+                if len(anomalous) == 1:
+                    # A single walled probe is conviction-grade only when its wall is
+                    # unmistakable: a >35 dB cliff sitting ON a measured codec lowpass.
+                    # A naturally dark 2 s passage has neither.
+                    t1, c1, cl1, vr1, _ = anomalous[0]
+                    seg_fp1 = self._codec_fingerprint(c1)
+                    if cl1 > 35.0 and seg_fp1:
+                        main += 25
+                        result.segment_map = [f"{int(t1 // 60):02d}:{int(t1 % 60):02d} → walled at {c1 / 1000:.1f} kHz (cliff {cl1:.0f} dB)"]
+                        lossy_ev.append(f"Partial Transcode (single region): one sampled clip at {int(t1 // 60):02d}:{int(t1 % 60):02d} is frequency-walled at {c1 / 1000:.1f} kHz with a {cl1:.0f} dB cliff sitting on the measured {seg_fp1[0]} {seg_fp1[1]} lowpass — a spliced lossy span inside otherwise full-band content.")
                 if len(anomalous) >= 2:
-                    # Confidence scales with coverage, and a codec fingerprint on the
-                    # walled clips' median cutoff upgrades it to near-certain (+55 total,
-                    # same as a failed whole-file vote — the spliced part IS a transcode).
-                    seg_fp = self._codec_fingerprint(float(np.median([c for _, c, _ in anomalous])))
+                    # Confidence scales with coverage; a digital void under the walled
+                    # clips (impossible naturally) or a codec fingerprint on their median
+                    # cutoff upgrades it further.
+                    seg_fp = self._codec_fingerprint(float(np.median([c for _, c, *_ in anomalous])))
                     bonus = 40 if len(anomalous) >= 4 else 30
+                    if void_backed: bonus += 25
                     if seg_fp: bonus += 15
                     main += bonus
                     result.segment_map = [
-                        f"{int(t // 60):02d}:{int(t % 60):02d} → walled at {c / 1000:.1f} kHz (cliff {cl:.0f} dB)"
-                        for t, c, cl in anomalous]
-                    regions = ", ".join(f"{int(t // 60):02d}:{int(t % 60):02d}" for t, _, _ in anomalous[:6])
+                        f"{int(t // 60):02d}:{int(t % 60):02d} → walled at {c / 1000:.1f} kHz ({'digital void above' if kind == 'void' else f'cliff {cl:.0f} dB'})"
+                        for t, c, cl, vr, kind in anomalous]
+                    regions = ", ".join(f"{int(t // 60):02d}:{int(t % 60):02d}" for t, *_ in anomalous[:6])
                     fp_note = f" — walls sit on a measured codec lowpass (nearest profile: {seg_fp[0]} {seg_fp[1]})" if seg_fp else ""
-                    lossy_ev.append(f"Partial Transcode: {len(anomalous)}/{len(seg_data)} sampled clips are frequency-walled while the rest of the file is full-band — spliced or partially transcoded content (walled at {regions}){fp_note}.")
+                    void_note = " with a digital void above the wall (impossible in genuine content)" if void_backed else ""
+                    lossy_ev.append(f"Partial Transcode: {len(anomalous)}/{len(seg_data)} sampled clips are frequency-walled{void_note} while the rest of the file is full-band — spliced or partially transcoded content (walled at {regions}){fp_note}.")
 
             # Rule: silence dither / vinyl noise / clicks (3-phase)
             if not cassette_detected:
                 st("silence & vinyl analysis")
-                sil_score, sil_ev, sil_ratio, vinyl_detected, clicks = self._silence_and_vinyl(audio, cutoff_hz, noise_band=noise_band)
+                sil_score, sil_ev, sil_ratio, vinyl_detected, clicks = self._silence_and_vinyl(audio, cutoff_hz, noise_band=noise_band, cliff_db=cliff_depth)
                 result.silence_ratio, result.vinyl_noise_detected, result.vinyl_clicks_per_min = sil_ratio, vinyl_detected, clicks
                 main += sil_score
                 (lossy_ev if sil_score > 0 else natural_ev).extend(sil_ev)
@@ -1711,7 +1846,12 @@ class SpectralEngine:
             if self.sample_rate >= 40000 and 0 < auc_avg < 16500 and not cassette_detected and not vinyl_detected:
                 main += 25
                 lossy_ev.append(f"auCDtect Bound Collapse: spectral scatter dies at {auc_avg:,.0f} Hz on average — the statistical void of a lossy codec.")
-            if auc_phase > 4.5 and cutoff_hz < self.nyquist * 0.85:
+            # Quantized HF phase is codec evidence only when the cutoff is in codec
+            # territory AND ends in a wall — genuine masters with gentle 20-48 kHz
+            # mastering filters have noisy HF phase too (the report's +10 false
+            # positive on 24/96 files). Corroborating evidence, never standalone.
+            if (auc_phase > 4.5 and cutoff_hz < self.nyquist * 0.85
+                    and cutoff_hz < self.CODEC_CEILING_HZ and cliff_depth > 25.0):
                 main += 10
                 lossy_ev.append(f"High-Band Phase Disruption: phase-difference entropy {auc_phase:.2f} bits with a depressed cutoff — quantized HF phase relationships.")
 
@@ -1781,8 +1921,16 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
     try: claimed_bitrate = int(re.sub(r"[^\d]", "", tech.bit_rate) or 0)
     except ValueError: claimed_bitrate = 0
 
+    # Native DSD reports its 1-bit rate (2.8/5.6 MHz) — decoding at that rate is
+    # pathological (gigabytes of float32). Decimate to 88.2 kHz: the audible band plus
+    # enough ultrasonic headroom for the DSD noise-shaping scan to see the 30 kHz+ rise.
+    native_dsd = tech.codec.upper().startswith("DSD") or filepath.suffix.lower() in {".dff", ".dsf"}
+    if native_dsd and sample_rate > 96000:
+        sample_rate = 88200
+
     engine = SpectralEngine(filepath, sample_rate, channels=channels,
-                            claimed_duration=tech.duration_sec, claimed_bitrate_kbps=claimed_bitrate)
+                            claimed_duration=tech.duration_sec, claimed_bitrate_kbps=claimed_bitrate,
+                            codec=tech.codec)
 
     # Subprocess-bound extractors run concurrently while the DSP engine crunches
     # on the main thread (numpy/scipy release the GIL for the heavy operations).
@@ -1814,7 +1962,12 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
     elif spectral.scipy_available and spectral.verdict_label != "INCONCLUSIVE":
         auth.header_integrity = "✓ Container header matches decoded stream"
     auth.bit_depth_authentic = bit_auth
+    if native_dsd:
+        auth.bit_depth_authentic = "DSD 1-bit stream — PCM trailing-zero analysis not applicable"
     auth.encoder_trace = detect_encoder_trace(tags, tech, filepath)
+    if mqa_note := detect_mqa(tags, tech, filepath):
+        spectral.caveats.append(mqa_note)
+        auth.mqa_detected = True
     # Byproducts of the engine's decode — no extra ffmpeg processes
     auth.phase_correlation, auth.phase_verdict = measure_phase_correlation(engine.audio_mid, engine.audio_side, sample_rate)
     auth.clipped_samples, auth.clipping_verdict = detect_clipping(engine.audio_mid, engine.audio_side)
@@ -2157,7 +2310,7 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     bd_val = _c(bd_col, bd_text)
     if bits_regenerated:
         bd_val += _c(C.GREY, " — interpolation/requantization regenerates the low-order bits")
-    for row in [_kv("Bit-Depth Auth", bd_val), _kv("Header Integrity", auth.header_integrity), _kv("Encoder Trace", _c(C.RED, auth.encoder_trace) if auth.encoder_trace else ""), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
+    for row in [_kv("Bit-Depth Auth", bd_val), _kv("Header Integrity", auth.header_integrity), _kv("Encoder Trace", _c(C.RED, auth.encoder_trace) if auth.encoder_trace else ""), _kv("MQA", _c(C.ORANGE, "⚠ MQA-encoded — folded payload not verifiable by PCM analysis") if auth.mqa_detected else ""), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
         if row: print(row)
     if auth.silence_sections:
         for s in auth.silence_sections[:4]: print(f"    {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")
@@ -2193,8 +2346,11 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
 
     print()
     print(_rule("─", W))
-    spec = report.spectrogram_path or report.filepath.with_name(f"{report.filepath.stem}_spectrogram.png")
-    print(f"  {_c(C.GREEN,'✓')} Spectrogram → {_c(C.DIM + C.WHITE, str(spec))}")
+    spec = report.spectrogram_path
+    if spec and Path(spec).exists():
+        print(f"  {_c(C.GREEN,'✓')} Spectrogram → {_c(C.DIM + C.WHITE, str(spec))}")
+    else:
+        print(f"  {_c(C.RED,'✗')} Spectrogram generation failed (SoX and ffmpeg renderers both errored)")
     if report.analysis_seconds:
         print(f"  {_c(C.GREY, f'Analysed in {report.analysis_seconds:.1f}s')}")
     print(_rule("─", W))
