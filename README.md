@@ -25,6 +25,8 @@ claim to be:
 - **Codec fingerprinting** — *which* encoder and bitrate left the wall (measured
   LAME/AAC/Vorbis lowpass frequencies, Opus' CELT 20 kHz band limit)
 - **Spliced/partial transcode detection** — which time regions are walled, reported as timestamps
+- **Fake hi-res detection** — was this "24/48" upsampled from a 44.1 kHz CD? Resamplers
+  leave a wall, a notch, or an aliased mirror at the source Nyquist; all three are caught
 - **Bit-depth authenticity** — 24-bit container, but do all 24 bits carry signal?
 - **Header forensics** — forged duration/bitrate headers ("Fakin' the Funk" checks)
 - **Analog source profiling** — vinyl surface noise and cassette tape signatures are
@@ -74,6 +76,7 @@ both 44.1 and 48 kHz:
 | Opus 64–192 kbps | **88 LIKELY_LOSSY** (every bitrate — CELT 20 kHz fingerprint) |
 | Vorbis q2–q4 | **91–100 LIKELY_LOSSY** |
 | 24/96 master → MP3 320 → 24-bit ALAC | **88 LIKELY_LOSSY** |
+| 16/44.1 upsampled to "24/48" or "24/96" (fake hi-res) | **45–75 SUSPICIOUS** — named as a sample-rate counterfeit |
 | Half-genuine / half-MP3 splice | **45 CAUTION** + walled regions listed with timestamps |
 | Genuine / dark master / vinyl / cassette / mono controls | **0 GENUINE** (zero false positives) |
 
@@ -97,6 +100,12 @@ One ffmpeg decode and one cached STFT feed every detector. Highlights:
 - **Spliced/partial detection** — per-clip cutoffs + per-clip cliff depth; ≥2 walled
   clips in an otherwise full-band file report exact mm:ss regions (+30–55 by coverage
   and fingerprint).
+- **Sample-rate provenance** — a "24/48" file upsampled from CD carries a fingerprint
+  at exactly 22,050 Hz: a hard wall (clean resampler), a deep notch with imaging noise
+  above it, or — for weak anti-imaging filters like ffmpeg's default — an aliased
+  *mirror image* of the sub-Nyquist spectrum, exposed by per-frame mirror correlation.
+  Nothing natural has features at precisely a foreign Nyquist. Verdict reads
+  "Sample-rate counterfeit — upsampled from 44.1 kHz (fake hi-res)".
 - **auCDtect-style bound frequency** — spectral scatter collapse exposes the
   statistical void a codec leaves even when noise is pasted on top.
 - **Silence dither analysis** — codec hash inside "silent" passages (+50). Asymmetric
@@ -109,8 +118,10 @@ One ffmpeg decode and one cached STFT feed every detector. Highlights:
 - **Analog vetoes** — vinyl (random, stable hiss + click transients) and cassette
   (tape hiss + natural slope + wow/flutter) subtract evidence instead of adding it;
   a real tape rip with a 14 kHz ceiling is *not* a transcode.
-- **Source integrity** — effective-bit-depth probe (16-in-24 padding detection),
-  header duration/bitrate plausibility, lossy-encoder fingerprints left in tags.
+- **Source integrity** — effective-bit-depth probe (16-in-24 padding detection;
+  resampling regenerates the low-order bits, so upsampled fakes are caught by the
+  sample-rate check instead), header duration/bitrate plausibility, lossy-encoder
+  fingerprints left in tags.
 
 Every fired rule prints a human-readable evidence line, so the verdict is auditable.
 

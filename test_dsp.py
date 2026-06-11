@@ -250,6 +250,82 @@ w_m, t_m, fake_m, segs_m = eng._segment_voting(mute)
 check("silent clips are skipped, not counted as walled", t_m < 9 and w_m == 0 and not fake_m, f"{w_m}/{t_m} walled")
 
 # ---------------------------------------------------------------------------
+print("\n== 17. Sample-rate provenance (upsample / fake hi-res) ==")
+SR48 = 48000
+eng48 = SpectralEngine(Path("dummy48.flac"), SR48, channels=2)
+bins48 = eng48._freq_bins()
+n48 = SR48 * 10
+white48 = RNG.standard_normal(n48)
+X48 = np.fft.rfft(white48)
+f48 = np.fft.rfftfreq(n48, 1.0 / SR48)
+
+# Notch + imaging (ffmpeg swr signature): hole at 22.05k, faint energy above it
+Xn = X48.copy()
+Xn[(f48 > 21850) & (f48 < 22250)] = 0.0
+Xn[f48 >= 22250] *= 10 ** (-30 / 20)
+fr_n, _, _ = eng48._compute_stft((np.fft.irfft(Xn, n=n48) * 0.3).astype(np.float32))
+hit_n = eng48._resample_check(fr_n, bins48)
+check("imaging notch at 22,050 Hz -> 44.1k heritage (notch mode)",
+      hit_n is not None and hit_n[0] == 44100 and hit_n[1] == "notch", f"{hit_n}")
+
+# Clean wall exactly at the foreign Nyquist (sox-style resampler)
+Xw = X48.copy()
+Xw[f48 > 22050] = 0.0
+fr_w, _, _ = eng48._compute_stft((np.fft.irfft(Xw, n=n48) * 0.3).astype(np.float32))
+hit_w = eng48._resample_check(fr_w, bins48)
+check("hard wall at exactly 22,050 Hz -> 44.1k heritage (wall mode)",
+      hit_w is not None and hit_w[0] == 44100 and hit_w[1] == "wall", f"{hit_w}")
+
+# Aliased mirror (ffmpeg swr weak filter): spectrum above 22.05k = mirrored copy of
+# below. Real images carry CONJUGATED coefficients (that's what locks the per-frame
+# magnitudes together) — plain copying decorrelates the frames.
+Xm = X48.copy()
+fold = np.searchsorted(f48, 22050.0)
+m_idx = np.arange(1, len(Xm) - fold)
+Xm[fold + m_idx] = np.conj(Xm[fold - m_idx]) * 10 ** (-6 / 20)   # image ~6 dB down
+xm = np.fft.irfft(Xm, n=n48).real.astype(np.float32) * 0.3
+fr_m, _, _ = eng48._compute_stft(xm)
+hit_m = eng48._resample_check(fr_m, bins48)
+check("aliased mirror around 22,050 Hz -> 44.1k heritage (mirror mode)",
+      hit_m is not None and hit_m[0] == 44100 and hit_m[1] == "mirror", f"{hit_m}")
+
+# Native full-band 48k content must stay clean
+fr_g, _, _ = eng48._compute_stft((RNG.standard_normal(n48) * 0.3).astype(np.float32))
+check("native 48k full-band noise -> no resample flag", eng48._resample_check(fr_g, bins48) is None)
+
+# A codec wall (Opus CELT 20.46k) is NOT a foreign Nyquist — must not fire
+Xo = X48.copy()
+Xo[f48 > 20460] = 0.0
+fr_o, _, _ = eng48._compute_stft((np.fft.irfft(Xo, n=n48) * 0.3).astype(np.float32))
+check("codec wall at 20.46 kHz -> not flagged as resample", eng48._resample_check(fr_o, bins48) is None)
+
+# 44.1k container has no lower standard rate to check
+check("44.1k container -> never checked", eng._resample_check(f_full, bins) is None)
+
+print("\n== 18. Fake hi-res by insufficient bandwidth ==")
+fh = SpectralEngine._is_fake_hires_bandwidth
+NYQ96 = 48000.0
+# The user's real case: 96k container, content dies at 20k, 35 dB cliff into a
+# -84 dB void (above wall-mode's -90, so _resample_check goes blind) -> must fire.
+check("96k, 20k wall, -84 dB void -> fake hi-res",
+      fh(96000, NYQ96, 20000, 35.0, -84.0, True), "the AAC256->24/96 miss")
+# Genuine hi-res: content reaches its own Nyquist -> must NOT fire.
+check("96k, content to ~47k -> not fake", not fh(96000, NYQ96, 47000, 1.3, -3.0, True))
+# Dark/analog 96k master: low cutoff but audible hiss above (loud void) -> must NOT fire.
+check("96k, 20k cutoff but -45 dB hiss above -> not fake (analog)",
+      not fh(96000, NYQ96, 20000, 35.0, -45.0, True))
+# Gentle mastering rolloff: low cutoff, shallow cliff -> must NOT fire.
+check("96k, 20k cutoff but 10 dB gradual rolloff -> not fake",
+      not fh(96000, NYQ96, 20000, 10.0, -90.0, True))
+# Not hi-res: a 48k container with a 20k wall is normal Redbook-class -> must NOT fire.
+check("48k container -> rule does not apply", not fh(48000, 24000.0, 20000, 35.0, -90.0, True))
+# Void never measured (cutoff too near Nyquist for a band) -> must NOT fire.
+check("void not measured -> not fake", not fh(96000, NYQ96, 20000, 35.0, -120.0, False))
+# Boundary: cutoff just under 60% of Nyquist with a wall+void -> fires; just over -> not.
+check("cutoff at 58% Nyquist -> fires", fh(96000, NYQ96, int(NYQ96 * 0.58), 30.0, -82.0, True))
+check("cutoff at 62% Nyquist -> not fake", not fh(96000, NYQ96, int(NYQ96 * 0.62), 30.0, -82.0, True))
+
+# ---------------------------------------------------------------------------
 failed = [n for n, ok, _ in _results if not ok]
 print(f"\n{'=' * 60}\n{len(_results) - len(failed)}/{len(_results)} checks passed.")
 if failed:

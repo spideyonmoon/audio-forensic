@@ -79,6 +79,7 @@ class _Status:
     # the estimate self-calibrates to the machine; no absolute speed model needed.
     _STAGE_PROGRESS = {
         "probing metadata": 0.0, "decoding": 0.02, "STFT": 0.14, "spectral metrics": 0.24,
+        "resample check": 0.28,
         "header integrity": 0.29, "psychoacoustic tests": 0.30, "cassette profile": 0.41,
         "segment voting": 0.55, "silence & vinyl analysis": 0.57, "auCDtect statistics": 0.63,
         "waiting on loudness/spectrogram": 0.80, "finalizing": 0.97,
@@ -205,6 +206,8 @@ class SpectralAnalysis:
     segment_walled: int = -1; segment_total: int = 0; segment_wall_hz: float = 16500.0
     segment_map: list[str] = field(default_factory=list)
     codec_fingerprint: str = ""
+    resample_detected: str = ""; resample_src_rate: int = 0
+    fake_hires: str = ""
     auc_avg_bound_freq: float = 0.0; auc_bound_interp: str = ""
     auc_prob_bound_freq: float = 0.0
     auc_phase_entropy: float = 0.0; auc_phase_interp: str = ""
@@ -519,13 +522,20 @@ def audit_replaygain(tags: AudioTags, lufs_integrated: str) -> tuple[str, str, s
     except (ValueError, IndexError): return stored_raw, lufs_integrated, "", ""
 
 
-def generate_spectrogram(filepath: Path) -> Path:
+def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Path:
     """Generates a clean mono spectrogram (SoX rendering — best visual quality).
 
     The decoded mono WAV is piped from ffmpeg straight into SoX's stdin: no temp
     file, no disk I/O. Height is 513 px (a power of two + 1) — SoX maps that to
     an efficient DFT size; 512 forces a pathological resampling path ~20x slower.
     Falls back to ffmpeg showspectrumpic if SoX fails.
+
+    ffmpeg can't seek back on the pipe to patch the WAV data-chunk size, so SoX
+    reads a bogus length ("Premature EOF on .wav input file") and can't scale the
+    time axis to ``-x``, collapsing the image to a ~150 px barcode. Feeding the
+    known container duration via the spectrogram ``-d`` effect restores the full
+    1280 px width. NB: plain seconds only — a bare ``s`` suffix means *samples*
+    in SoX time syntax, and ``"240.0s"`` is an outright parse error.
     """
     output = filepath.with_name(f"{filepath.stem}_spectrogram.png")
 
@@ -535,9 +545,12 @@ def generate_spectrogram(filepath: Path) -> Path:
         capture_output=True, check=False)
 
     if decode.returncode == 0 and decode.stdout:
+        spectro = ["spectrogram"]
+        if duration_sec > 0:
+            spectro += ["-d", f"{duration_sec:.3f}"]   # see docstring: scales the time axis to -x
         sox_result = subprocess.run(
             ["sox", "-t", "wav", "-", "-n",
-             "spectrogram",
+             *spectro,
              "-x", "1280",   # width in pixels
              "-y", "513",    # height in pixels (2^n + 1 -> fast DFT path in SoX)
              "-z", "120",    # dynamic range in dB
@@ -588,6 +601,14 @@ def calculate_temporal_variance(data: "np.ndarray", sample_rate: int, segment_du
     energies_db = 20 * np.log10(rms + 1e-12)
     return float(np.std(energies_db))
 
+# Always-on educational context notes (not findings about *this* file). Suppressed
+# once the verdict is decided (SUSPICIOUS+); only file-specific caveats survive then.
+_GENERIC_CONTEXT_NOTES = (
+    "Analog Origins: Vinyl and tape transfers naturally exhibit HF rolloff and higher noise floors; these are not suspicious traits.",
+    "Modern Mastering: Audio engineers frequently apply gentle low-pass filters at 19-20 kHz to prevent aliasing distortion.",
+    "Transcode Artifacts: Lossless encoders (FLAC/ALAC) will perfectly preserve lossy characteristics if the source material was already degraded prior to encoding.",
+)
+
 # ---------------------------------------------------------------------------
 # SpectralEngine — numpy/scipy FFT-based authenticity analysis
 # ---------------------------------------------------------------------------
@@ -618,6 +639,10 @@ class SpectralEngine:
         ("Vorbis", "q2 (~96 kbps)", 16575, 150),
         ("Opus", "CELT 20 kHz band limit (any bitrate)", 20460, 260),
     )
+    # Standard rates a counterfeit "hi-res" file may secretly come from. A resampler
+    # leaves its fingerprint at the SOURCE rate's Nyquist — a frequency where natural
+    # audio never has features (checked lowest-first so the true origin wins).
+    RESAMPLE_SOURCE_RATES = (44100, 48000, 88200, 96000)
 
     # Time-domain analyses (Hilbert envelopes, cascaded band filters) are capped to
     # this many seconds to bound CPU/RAM on very long files; spectral stats use the full decode.
@@ -1361,6 +1386,71 @@ class SpectralEngine:
 
         return l_score, l_ev, n_score, n_ev
 
+    def _resample_check(self, frames: "np.ndarray", bins: "np.ndarray") -> "tuple[int, str, float] | None":
+        """Sample-rate provenance: hunt for resampler fingerprints at foreign Nyquists.
+
+        Upsampling (e.g. 44.1 kHz Red Book -> "24/48") leaves one of two signatures
+        at the source rate's Nyquist:
+          - "wall":  the spectrum ends in a cliff exactly there (clean resampler);
+          - "notch": a deep hole exactly there with imaging/injected energy ABOVE it.
+                     The energy above pushes the measured HF cutoff to full bandwidth
+                     and defeats every cutoff-based detector — but nothing natural
+                     carves a 20+ dB hole at precisely 22,050 Hz;
+          - "mirror": a weak anti-imaging filter (ffmpeg swr default) passes the
+                     aliased images almost unattenuated, so the spectrum continues
+                     smoothly across the fold — but the content above fn is a
+                     MIRROR image of the content below it, exposed by per-frame
+                     magnitude correlation of the two bands.
+        Returns (source_rate, mode, depth_db_or_corr) or None.
+        """
+        if frames.shape[0] == 0: return None
+        avg = frames.mean(axis=0).astype(np.float64)
+        db = 20.0 * np.log10(avg / (avg.max() + 1e-12) + 1e-12)
+        bin_hz = bins[1] - bins[0]
+
+        def band(lo_hz: float, hi_hz: float) -> float:
+            i0, i1 = max(0, int(lo_hz / bin_hz)), min(len(db), int(hi_hz / bin_hz) + 1)
+            return float(db[i0:i1].mean()) if i1 > i0 else -200.0
+
+        for rate in self.RESAMPLE_SOURCE_RATES:
+            fn = rate / 2.0
+            if fn + 1200.0 > self.nyquist - 200.0: continue   # need >=750 Hz of room above
+            edge = band(fn - 900, fn - 350)                   # music just below the transition band
+            if edge < -80.0: continue                          # nothing alive near this Nyquist — no evidence either way
+            notch = band(fn - 150, fn + 250)                  # resampler transition/void straddles fn
+            above = band(fn + 450, min(fn + 2000, self.nyquist - 200))   # imaging/noise flank
+            ceiling = band(fn + 450, self.nyquist - 200)      # everything above (wall mode)
+            if edge - notch >= 20.0 and above - notch >= 20.0:
+                return rate, "notch", min(edge, above) - notch
+            if ceiling < edge - 40.0 and ceiling < -90.0:
+                return rate, "wall", edge - ceiling
+            # Mirror mode: correlate the band below fn against the band above it,
+            # per frame (bin fn-x pairs with bin fn+x), with a guard band around
+            # the fold to skip the resampler's transition region. Aliased images
+            # carry conjugated coefficients, so frame magnitudes mirror EXACTLY
+            # per bin — sample the mirror positions with fractional-bin
+            # interpolation (the fold sits between bin centres) and do NOT
+            # smooth: smoothing mixes in uncorrelated secondary images
+            # (fractional resamplers fold k>=2 images into the same band) and
+            # dilutes the correlation. Measured: ffmpeg swr 44.1->48 fixture
+            # 0.49, genuine full-band noise 0.003.
+            c, g = int(round(fn / bin_hz)), int(300.0 / bin_hz)
+            half = min(int(1800.0 / bin_hz), len(db) - 4 - c - g, c - g)
+            if half * bin_hz >= 700.0 and above > -85.0:
+                lo_idx = np.arange(c - g - half, c - g)
+                target = (fn * 2.0 / bin_hz) - lo_idx           # fractional mirror positions
+                t0 = np.floor(target).astype(np.int64); tfrac = target - t0
+                hi_lin = frames[:, t0] * (1.0 - tfrac) + frames[:, t0 + 1] * tfrac
+                lo_band = np.log(frames[:, lo_idx].astype(np.float64) + 1e-12)
+                hi_band = np.log(hi_lin.astype(np.float64) + 1e-12)
+                lo_band -= lo_band.mean(axis=1, keepdims=True)
+                hi_band -= hi_band.mean(axis=1, keepdims=True)
+                denom = np.sqrt((lo_band * lo_band).sum(axis=1) * (hi_band * hi_band).sum(axis=1)) + 1e-12
+                mirror_corr = float(np.mean((lo_band * hi_band).sum(axis=1) / denom))
+                if mirror_corr > 0.35:
+                    return rate, "mirror", mirror_corr
+        return None
+
     def _codec_fingerprint(self, cutoff_hz: float) -> "tuple[str, str, int] | None":
         """Nearest measured codec wall within tolerance → (codec, profile, wall_hz).
         A cutoff that lands exactly on a measured encoder lowpass is a signature;
@@ -1373,13 +1463,25 @@ class SpectralEngine:
                 best = (d, codec, profile, hz)
         return (best[1], best[2], best[3]) if best else None
 
+    @staticmethod
+    def _is_fake_hires_bandwidth(sample_rate: int, nyquist: float, cutoff_hz: float,
+                                 cliff_depth: float, void_db: float, void_measured: bool) -> bool:
+        """Fake hi-res by insufficient bandwidth: a high-rate container whose content
+        ends in a hard wall far below its own Nyquist, with a digital void above.
+
+        Catches Redbook -> lossy -> hi-res chains where the codec lowpass erased the
+        foreign-Nyquist tell (notch/mirror/wall), so the cutoff-based and resample
+        detectors all go blind. Gated hard so genuine high-rate masters (content to
+        Nyquist) and gentle/analog rolloffs (shallow cliff, audible hiss above) never
+        trip it: only >=88.2 kHz, cutoff <60% Nyquist, >25 dB cliff, measured void
+        below -80 dB qualifies. Thresholds live here so they're tunable in one place."""
+        return (sample_rate >= 88200 and 0 < cutoff_hz < nyquist * 0.6
+                and cliff_depth > 25.0 and void_measured and void_db < -80.0)
+
     def _verdict(self, main_score: int, net_score: int, cutoff_hz: float, dsd_detected: bool,
-                 cassette: bool = False, vinyl: bool = False) -> tuple[str, str, list[str]]:
-        caveats = [
-            "Analog Origins: Vinyl and tape transfers naturally exhibit HF rolloff and higher noise floors; these are not suspicious traits.",
-            "Modern Mastering: Audio engineers frequently apply gentle low-pass filters at 19-20 kHz to prevent aliasing distortion.",
-            "Transcode Artifacts: Lossless encoders (FLAC/ALAC) will perfectly preserve lossy characteristics if the source material was already degraded prior to encoding."
-        ]
+                 cassette: bool = False, vinyl: bool = False, resampled_from: int = 0,
+                 fake_hires: str = "") -> tuple[str, str, list[str]]:
+        caveats = list(_GENERIC_CONTEXT_NOTES)
         ext = self.filepath.suffix.lower()
         if ext in {".mp3", ".aac", ".ogg", ".opus", ".wma"}:
             fp = self._codec_fingerprint(cutoff_hz)
@@ -1391,7 +1493,11 @@ class SpectralEngine:
         if dsd_detected: caveats.append("DSD transcode detected. Ultrasonic noise inflates entropy and HF scores.")
         if cassette: caveats.append("Cassette source profile matched — HF limitations are analog tape physics, not codec damage.")
         if vinyl: caveats.append("Vinyl surface noise detected — rolloff and noise floor traits are analog, not codec damage.")
+        if resampled_from: caveats.append("Sample-rate upscale detected — bit-depth verification cannot see through resampling (interpolation regenerates the low-order bits), so a 'verified' bit-depth reading does not prove source depth.")
+        if fake_hires: caveats.append("Fake hi-res by bandwidth — the container's high sample rate carries no matching high-frequency content. Bit-depth verification is also unreliable here; the upsample regenerated the low-order bits.")
         if main_score >= 86: return "LIKELY_LOSSY", "✗  Lossy transcode detected — fake lossless (high certainty)", caveats
+        elif resampled_from: return "SUSPICIOUS", f"⚠  Sample-rate counterfeit — upsampled from {resampled_from / 1000:g} kHz (fake hi-res)", caveats
+        elif fake_hires: return "SUSPICIOUS", f"⚠  Fake hi-res — {fake_hires} (upsampled)", caveats
         elif main_score >= 55: return "SUSPICIOUS", "⚠  Strong lossy indicators — probable transcode", caveats
         elif main_score >= 31: return "CAUTION", "~  Minor spectral quirks — possibly legitimate", caveats
         elif main_score >= 11: return "LIKELY_GENUINE", "✓  Consistent with genuine lossless source", caveats
@@ -1456,6 +1562,25 @@ class SpectralEngine:
         cassette_detected, vinyl_detected = False, False
         mp3_profile_match = any(abs(cutoff_hz - freq) <= 300 for freq in self.MP3_CUTOFFS.values()) and cutoff_hz < 20000
 
+        # Rule: sample-rate provenance — upsample / fake hi-res detection (numpy-only,
+        # runs even without scipy). Digital evidence: immune to the analog vetoes.
+        st("resample check")
+        resample_hit = self._resample_check(frames, bins)
+        if resample_hit:
+            res_rate, res_mode, res_depth = resample_hit
+            fn_src = res_rate // 2
+            result.resample_src_rate = res_rate
+            if res_mode == "notch":
+                result.resample_detected = f"upsampled from {res_rate / 1000:g} kHz — imaging notch at {fn_src:,} Hz ({res_depth:.0f} dB deep)"
+                lossy_ev.append(f"Sample-Rate Upscale: {res_depth:.0f} dB spectral notch at exactly {fn_src:,} Hz — the {res_rate / 1000:g} kHz Nyquist. The file was upsampled; energy above the notch is resampler imaging/noise, not music, and the container rate ({self.sample_rate / 1000:g} kHz) is counterfeit.")
+            elif res_mode == "mirror":
+                result.resample_detected = f"upsampled from {res_rate / 1000:g} kHz — aliased mirror around {fn_src:,} Hz (corr {res_depth:.2f})"
+                lossy_ev.append(f"Sample-Rate Upscale: the spectrum above {fn_src:,} Hz is a mirror image of the spectrum below it (per-frame correlation {res_depth:.2f}) — aliasing imaging from a low-quality upsampler. The container rate ({self.sample_rate / 1000:g} kHz) is counterfeit.")
+            else:
+                result.resample_detected = f"upsampled from {res_rate / 1000:g} kHz — wall at exactly {fn_src:,} Hz"
+                lossy_ev.append(f"Sample-Rate Upscale: spectrum ends in a hard wall at exactly {fn_src:,} Hz — the {res_rate / 1000:g} kHz Nyquist — with digital void above. The container rate ({self.sample_rate / 1000:g} kHz) is counterfeit.")
+            main += 45
+
         if _SCIPY_OK:
             # Rule: Fakin' the Funk header integrity
             st("header integrity")
@@ -1493,6 +1618,21 @@ class SpectralEngine:
                 noise_band = self._fft_band_extract(cap, band_lo, band_hi)
                 void_db = 20 * math.log10(float(np.sqrt(np.mean(noise_band ** 2))) + 1e-12)
 
+            # Rule: fake hi-res by insufficient bandwidth. A >=88.2 kHz container whose
+            # content ends in a hard wall far below its OWN Nyquist, with a digital void
+            # above, was upsampled from a lower rate — even when the foreign-Nyquist tell
+            # (notch/mirror/wall) was erased by a codec lowpass sitting below it. Redbook
+            # -> AAC -> 24/96 is the canonical miss: AAC's ~20 kHz lowpass kills the
+            # 22,050 Hz signature, so _resample_check goes blind on a dead band. Genuine
+            # hi-res carries content/noise well past 24 kHz; a 20 kHz ceiling in a 96k
+            # file is counterfeit. Gated hard (hi-res rate + cutoff <60% Nyquist + steep
+            # cliff + digital void) so dark analog masters and gentle LPFs never trip it.
+            if not resample_hit and self._is_fake_hires_bandwidth(
+                    self.sample_rate, self.nyquist, cutoff_hz, cliff_depth, void_db, noise_band is not None):
+                main += 20
+                result.fake_hires = f"{self.sample_rate / 1000:g} kHz container but bandwidth ends at {cutoff_hz / 1000:.1f} kHz"
+                lossy_ev.append(f"Fake Hi-Res Bandwidth: the {self.sample_rate / 1000:g} kHz container carries nothing above {cutoff_hz / 1000:.1f} kHz — a {cliff_depth:.0f} dB wall into a digital void ({void_db:.0f} dB) at {cutoff_hz / self.nyquist * 100:.0f}% of Nyquist. Genuine high-rate masters reach far higher; the stream was upsampled and the sample rate is counterfeit.")
+
             # Rule: AFD PRO segment voting (skipped under cassette veto).
             # Adaptive wall: a steep cliff (>30 dB) with a verified digital void above it
             # IS a codec wall wherever it sits — track it instead of the fixed 16.5 kHz so
@@ -1506,7 +1646,11 @@ class SpectralEngine:
             fingerprint = self._codec_fingerprint(cutoff_hz)
             void_verified = noise_band is not None and void_db < -85.0
             wall_hz = 16500.0
-            if cliff_depth > 30.0 and (void_verified or fingerprint):
+            # A wall sitting exactly on a foreign Nyquist is resample evidence, not a
+            # codec wall — arming the vote on it would mislabel a lossless upsample
+            # as "whole-file lossy ancestry" (the resample rule already scored it).
+            wall_is_resample = resample_hit is not None and resample_hit[1] == "wall"
+            if cliff_depth > 30.0 and (void_verified or fingerprint) and not wall_is_resample:
                 wall_hz = max(wall_hz, cutoff_hz + 400.0)
             seg_walled, seg_total, seg_fail, seg_data = self._segment_voting(audio, wall_hz=wall_hz)
             result.segment_walled, result.segment_total, result.segment_wall_hz = seg_walled, seg_total, wall_hz
@@ -1545,7 +1689,8 @@ class SpectralEngine:
                 # Clean silence is weak, asymmetric evidence (lossy encoders zero out
                 # silence too) — credit it only when the spectrum is full-bandwidth and
                 # no wall evidence exists, and keep it small.
-                if 0 <= sil_ratio < 0.15 and not seg_fail and wall_hz <= 16500.0 and cutoff_hz > self.nyquist * 0.85:
+                # (a resampled file's clean silence proves nothing about provenance)
+                if 0 <= sil_ratio < 0.15 and not seg_fail and wall_hz <= 16500.0 and cutoff_hz > self.nyquist * 0.85 and not resample_hit:
                     main -= 30
                     natural_ev.append(f"Clean Silence Floor: silent passages are spectrally clean (ratio {sil_ratio:.2f}) in a full-bandwidth spectrum — consistent with an unmolested lossless master.")
 
@@ -1585,7 +1730,8 @@ class SpectralEngine:
                 lossy_ev.append(f"Fake HF Noise Injection: ultrasonic band is statistically independent of the music (corr {ultra:.2f}) while organic scatter dies at {auc_avg:,.0f} Hz — noise pasted above a codec wall.")
 
         main = max(0, min(100, main))
-        label, sentence, caveats = self._verdict(main, net_score, cutoff_hz, dsd_detected, cassette_detected, vinyl_detected)
+        label, sentence, caveats = self._verdict(main, net_score, cutoff_hz, dsd_detected, cassette_detected, vinyl_detected,
+                                                 resampled_from=result.resample_src_rate, fake_hires=result.fake_hires)
 
         legit_cutoff = cutoff_hz > (self.nyquist * 0.85)
 
@@ -1643,7 +1789,7 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_loud = pool.submit(extract_loudness, filepath)
         f_sox = pool.submit(extract_sox_stats, filepath)
-        f_spec = pool.submit(generate_spectrogram, filepath)
+        f_spec = pool.submit(generate_spectrogram, filepath, tech.duration_sec)
         f_bits = pool.submit(check_bit_depth_authenticity, filepath, claimed_depth, tech.duration_sec)
         spectral = engine.analyse(max_seconds=fast_secs, status=lambda s: _Status.update(name, s))
         _Status.update(name, "waiting on loudness/spectrogram")
@@ -1943,9 +2089,13 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
             else: cass_val = _c(C.GREY, "not detected")
             hdr_mm = sp.header_duration_mismatch or sp.header_bitrate_mismatch
             fp_val = _c(C.RED, f"⚠ {sp.codec_fingerprint} wall profile") if sp.codec_fingerprint else _c(C.GREEN, "✓ cutoff matches no known encoder wall")
+            if sp.resample_detected: res_val = _c(C.RED, f"⚠ {sp.resample_detected}")
+            elif sp.fake_hires: res_val = _c(C.ORANGE, f"⚠ fake hi-res — {sp.fake_hires} (upsampled; codec lowpass erased the Nyquist tell)")
+            else: res_val = _c(C.GREEN, "✓ no foreign-Nyquist resampler artifacts")
             rows_adv = [
                 _kv("Header Integrity", _c(C.RED, "⚠ header/stream mismatch — forged or truncated") if hdr_mm else _c(C.GREEN, "✓ container matches decoded stream")),
                 _kv("Codec Fingerprint", fp_val),
+                _kv("Resample Check", res_val),
                 _kv("Segment Vote", seg_val),
                 _kv("auCDtect Bound", _c(_bound_colour(sp.auc_avg_bound_freq), f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode") + "  " + _c(C.GREY, sp.auc_bound_interp)),
                 _kv("HF Phase Entropy", _c(_phase_ent_colour(sp.auc_phase_entropy), f"{sp.auc_phase_entropy:.2f} bits") + "  " + _c(C.GREY, sp.auc_phase_interp)),
@@ -1967,15 +2117,20 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
         else:
             print(f"  {_c(C.YELLOW, '⚠ scipy not installed — advanced forensic suite skipped (pip install scipy)')}")
 
+        # Once the verdict is decided (SUSPICIOUS+), the green "Natural indicators"
+        # read as if they argue against it and the always-on context notes are noise —
+        # suppress both, keeping only file-specific caveats under a "Caveats" header.
+        decided = sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY")
         if sp.evidence:
             print(f"\n  {_c(C.DIM + C.ORANGE, 'Lossy indicators')}")
             for e in sp.evidence: print(f"    {_c(C.GREY, '·')} {_c(C.WHITE, e)}")
-        if sp.natural_evidence:
+        if sp.natural_evidence and not decided:
             print(f"\n  {_c(C.DIM + C.GREEN, 'Natural indicators')}")
             for n in sp.natural_evidence: print(f"    {_c(C.GREY, '·')} {_c(C.GREEN, n)}")
-        if sp.caveats:
-            print(f"\n  {_c(C.DIM + C.GREY, 'Context notes')}")
-            for cv in sp.caveats: print(f"    {_c(C.GREY, '·')} {_c(C.DIM + C.WHITE, cv)}")
+        notes = [cv for cv in sp.caveats if not decided or cv not in _GENERIC_CONTEXT_NOTES]
+        if notes:
+            print(f"\n  {_c(C.DIM + C.GREY, 'Caveats' if decided else 'Context notes')}")
+            for cv in notes: print(f"    {_c(C.GREY, '·')} {_c(C.DIM + C.WHITE, cv)}")
     else:
         for row in [_kv("HF Cutoff", auth.spectral_cutoff_hz), _kv("Spectral Verdict", auth.spectral_cutoff_verdict), _kv("LPF Detected", ("⚠ YES — cutoff at " + auth.lpf_cutoff_hz) if auth.lpf_detected else "✓ No LPF detected")]:
             if row: print(row)
@@ -1984,8 +2139,25 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     source_flags = []
     if auth.cassette_rip_detected: source_flags.append("cassette tape")
     if auth.vinyl_rip_detected: source_flags.append("vinyl")
-    bd_col = C.RED if auth.bit_depth_authentic.startswith("⚠") else (C.GREEN if auth.bit_depth_authentic.startswith("✓") else C.WHITE)
-    for row in [_kv("Bit-Depth Auth", _c(bd_col, auth.bit_depth_authentic)), _kv("Header Integrity", auth.header_integrity), _kv("Encoder Trace", _c(C.RED, auth.encoder_trace) if auth.encoder_trace else ""), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
+    bd_text = auth.bit_depth_authentic
+    # Any transcode/upsample chain repopulates the low-order bits (float decode +
+    # re-quantization, or resampling interpolation), so the trailing-zero pass is
+    # blind to the source depth. Don't render it as a confident green "Verified"
+    # pass — that contradicts the lossy/upscale finding above. Keyed on its own
+    # broad condition (resample OR fake-hi-res OR a decided lossy verdict) so a
+    # green "Verified" never appears on a file the engine already called fake,
+    # independent of the bandwidth detector's own thresholds.
+    bits_regenerated = bool(sp and bd_text.startswith("✓") and (
+        sp.resample_detected or sp.fake_hires or sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY")))
+    if bits_regenerated:
+        depth = bd_text.split(" — ")[0].replace("✓ Verified ", "")
+        bd_text = f"~ {depth} container full, but source depth unverifiable on a transcoded/upsampled stream"
+    bd_col = (C.RED if bd_text.startswith("⚠") else C.GREEN if bd_text.startswith("✓")
+              else C.ORANGE if bits_regenerated else C.WHITE)
+    bd_val = _c(bd_col, bd_text)
+    if bits_regenerated:
+        bd_val += _c(C.GREY, " — interpolation/requantization regenerates the low-order bits")
+    for row in [_kv("Bit-Depth Auth", bd_val), _kv("Header Integrity", auth.header_integrity), _kv("Encoder Trace", _c(C.RED, auth.encoder_trace) if auth.encoder_trace else ""), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
         if row: print(row)
     if auth.silence_sections:
         for s in auth.silence_sections[:4]: print(f"    {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")
