@@ -118,10 +118,14 @@ One ffmpeg decode and one cached STFT feed every detector. Highlights:
 - **Analog vetoes** — vinyl (random, stable hiss + click transients) and cassette
   (tape hiss + natural slope + wow/flutter) subtract evidence instead of adding it;
   a real tape rip with a 14 kHz ceiling is *not* a transcode.
-- **Source integrity** — effective-bit-depth probe (16-in-24 padding detection;
-  resampling regenerates the low-order bits, so upsampled fakes are caught by the
-  sample-rate check instead), header duration/bitrate plausibility, lossy-encoder
-  fingerprints left in tags.
+- **Source integrity** — two-prong bit-depth forensics: a per-channel *used-bits*
+  pass that proves clean integer padding (16-in-24), plus a *noise-floor* pass that
+  reads the effective dynamic range. When a quiet passage exposes the floor it can
+  confirm genuine >16-bit content, or flag a flat 16-bit dither floor hiding under a
+  24-bit container — while honestly abstaining on loud masters where the floor is
+  masked (a transparent 16→24 upsample of a noisy source is physically
+  indistinguishable from native 24-bit). Plus header duration/bitrate plausibility
+  and lossy-encoder fingerprints left in tags.
 
 Every fired rule prints a human-readable evidence line, so the verdict is auditable.
 

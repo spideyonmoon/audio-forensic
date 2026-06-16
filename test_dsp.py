@@ -330,6 +330,73 @@ check("void not measured -> not fake", not fh(96000, NYQ96, 20000, 35.0, -120.0,
 check("cutoff at 58% Nyquist -> fires", fh(96000, NYQ96, int(NYQ96 * 0.58), 30.0, -82.0, True))
 check("cutoff at 62% Nyquist -> not fake", not fh(96000, NYQ96, int(NYQ96 * 0.62), 30.0, -82.0, True))
 
+print("\n== 19. Bit-depth forensics (two prongs) ==")
+from audio_forensic import _effective_bits, _noise_floor_profile, _bit_depth_verdict
+
+# ---- Prong 1: used-bits / clean-pad detection on MSB-aligned int32 ----
+# A genuine 24-bit signal: random 24-bit values placed MSB-aligned (<<8), low bit live.
+v24 = (RNG.integers(-(2**23), 2**23, size=200000) | 1).astype(np.int64) << 8
+st24 = np.repeat(v24, 2).astype(np.int32)               # duplicate into stereo lanes
+check("effective_bits: 24-bit MSB-aligned -> 24", _effective_bits(st24, 2) == 24, str(_effective_bits(st24, 2)))
+
+# Clean 16->24 pad: 16-bit values shifted <<16 (bottom 8 of the 24-bit field dead).
+v16 = (RNG.integers(-(2**15), 2**15, size=200000) | 1).astype(np.int64) << 16
+st16 = np.repeat(v16, 2).astype(np.int32)
+check("effective_bits: clean 16->24 pad -> 16", _effective_bits(st16, 2) == 16, str(_effective_bits(st16, 2)))
+
+# Per-channel: L padded to 16, R full 24 -> must report the deeper channel (24).
+mixed = np.empty(v16.size * 2, dtype=np.int32)
+mixed[0::2] = v16.astype(np.int32)                      # left: 16-bit pad
+mixed[1::2] = v24.astype(np.int32)                      # right: full 24-bit
+check("effective_bits: one full channel unmasks depth -> 24", _effective_bits(mixed, 2) == 24,
+      str(_effective_bits(mixed, 2)))
+
+# ---- Prong 2: noise-floor profile on synthetic int32 ----
+def _int32_from_float(x):
+    return np.clip(np.round(x * (2**31)), -(2**31), 2**31 - 1).astype(np.int32)
+
+sr = 48000
+nsec = 20
+t = np.arange(sr * nsec) / sr
+bursts = 0.4 * np.sin(2 * np.pi * 500 * t) * (np.sin(2 * np.pi * 0.15 * t) > 0.6)
+
+# Genuine quiet 24-bit: -110 dBFS white detail in the gaps -> floor well below 16-bit.
+deep = bursts + 10 ** (-110 / 20) * RNG.standard_normal(t.size)
+pg = _noise_floor_profile(np.repeat(_int32_from_float(deep), 2), 2, sr)
+check("floor profile: deep quiet floor < -102 dBFS", pg is not None and pg["floor_db"] < -102.0,
+      f"{pg['floor_db']:.1f}" if pg else "None")
+
+# 16-bit dither floor: flat/white noise at ~-95 dBFS in the gaps.
+flat16 = bursts + 10 ** (-95 / 20) * RNG.standard_normal(t.size)
+pf = _noise_floor_profile(np.repeat(_int32_from_float(flat16), 2), 2, sr)
+check("floor profile: 16-bit-level floor is flat", pf is not None and pf["flat"], f"{pf}" if pf else "None")
+
+# Loud master: no exposed floor (quietest window still loud) -> floor > -86.
+loud = 0.3 * np.sin(2 * np.pi * 440 * t) + 0.05 * RNG.standard_normal(t.size)
+pl = _noise_floor_profile(np.repeat(_int32_from_float(loud), 2), 2, sr)
+check("floor profile: loud master floor > -86 dBFS", pl is not None and pl["floor_db"] > -86.0,
+      f"{pl['floor_db']:.1f}" if pl else "None")
+
+# Colored (LF-heavy) analog floor: pink-ish noise -> NOT flat.
+pink = bursts + 10 ** (-90 / 20) * np.cumsum(RNG.standard_normal(t.size)) / 30.0
+pc = _noise_floor_profile(np.repeat(_int32_from_float(pink), 2), 2, sr)
+check("floor profile: colored analog floor is not flat", pc is not None and not pc["flat"],
+      f"slope={pc['slope_db']:.1f}" if pc else "None")
+
+# ---- Verdict tiers (pure function, no audio) ----
+LOUD = {"floor_db": -40.0, "flat": False, "slope_db": -50.0}
+DEEP = {"floor_db": -113.0, "flat": True, "slope_db": 0.1}
+FLAT16 = {"floor_db": -95.0, "flat": True, "slope_db": -0.2}
+ANALOG = {"floor_db": -94.0, "flat": False, "slope_db": -25.0}
+check("verdict: clean pad 24<-16 -> upscaled", _bit_depth_verdict(24, 16, LOUD).startswith("⚠ Upscaled"))
+check("verdict: 20-in-24 -> reduced-depth tilde", _bit_depth_verdict(24, 20, LOUD).startswith("~ 20 of 24"))
+check("verdict: full bits + loud master -> abstain ✓", "not independently confirmable" in _bit_depth_verdict(24, 24, LOUD))
+check("verdict: full bits + deep quiet floor -> genuine", _bit_depth_verdict(24, 24, DEEP).startswith("✓ Genuine"))
+check("verdict: full bits + flat 16-bit floor -> effective ~16-bit", _bit_depth_verdict(24, 24, FLAT16).startswith("⚠ Effective ~16-bit"))
+check("verdict: full bits + colored floor -> analog tilde (no false ⚠)", _bit_depth_verdict(24, 24, ANALOG).startswith("~ Noise floor"))
+check("verdict: 16-bit claim + flat 16-bit floor -> consistent ✓", _bit_depth_verdict(16, 16, FLAT16).startswith("✓ 16-bit consistent"))
+check("verdict: no profile -> honest unconfirmable", "not independently confirmable" in _bit_depth_verdict(24, 24, None))
+
 # ---------------------------------------------------------------------------
 failed = [n for n, ok, _ in _results if not ok]
 print(f"\n{'=' * 60}\n{len(_results) - len(failed)}/{len(_results)} checks passed.")

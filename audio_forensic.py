@@ -442,15 +442,128 @@ def extract_loudness(filepath: Path) -> tuple[LoudnessProfile, str]:
     dr_score = f"DR{int(float(dr_match.group(1)))}" if dr_match else "N/A"
     return lp, dr_score
 
-def check_bit_depth_authenticity(filepath: Path, claimed_depth: int, duration_sec: float = 0.0) -> str:
-    """Effective-bit-depth forensics via trailing-zero analysis of raw PCM.
+# --- Bit-depth forensics constants -------------------------------------------
+# A bit rank must fire in >= this fraction of samples to count as "in use"
+# (robust to stray corrupt samples / a handful of denormal values).
+_BD_ACTIVE_FRAC = 1e-4
+# TPDF-dithered 16-bit noise floor: 6.02*N - 3 dB below full scale. Sample-rate
+# independent (the floor LEVEL doesn't move with SR — it just spreads over a wider
+# band). Sources: audiocheck.net/audiotests_dithering, tonmeister "High-Res Part 6".
+_BD_16BIT_FLOOR_DBFS = -93.0
+# To read a noise floor at all, the quietest sustained window must drop below this.
+# Loudness-war commercial masters sit far above it (measured quietest-window RMS:
+# -26 dBFS web hi-res, -34 redbook, -59 MFSL) -> the floor is masked -> we ABSTAIN.
+_BD_FLOOR_EXPOSED_DBFS = -86.0
+# A floor below this proves content exists beneath the 16-bit dither floor -> the
+# source genuinely carries >16-bit information (cannot be a 16-bit upsample). Set a
+# few dB under the dither floor's lower edge (TPDF runs -93..-99 dBFS depending on
+# the dither) so a real 16-bit floor never tips into a "genuine hi-res" reading.
+_BD_GENUINE_HIRES_DBFS = -102.0
+# Only assert "sitting at the 16-bit dither level" when the flat floor is actually
+# down near -93 dBFS; a flat floor higher than this is worse than 16-bit (limited DR).
+_BD_16BIT_LEVEL_MAX_DBFS = -89.0
+# |HF-LF| of the exposed floor below this => spectrally flat/white = TPDF dither
+# signature (16-bit tell). Above it and LF-heavy => analog hiss (genuine analog).
+_BD_FLOOR_FLAT_TOL_DB = 7.0
+
+
+def _effective_bits(arr_i32: "np.ndarray", channels: int) -> int:
+    """Highest bit-depth actually exercised, MSB-aligned, across all channels.
+
+    ffmpeg renders an N-bit sample MSB-aligned in the 32-bit container (a 16-bit
+    value lands on multiples of 2**16, a 24-bit value on multiples of 2**8). The
+    lowest bit rank hit by >= _BD_ACTIVE_FRAC of a channel's nonzero samples marks
+    that channel's live depth; we take the deepest channel so a one-channel pad (or
+    a silent channel) can't mask bits the file really uses.
+    """
+    if channels < 1:
+        channels = 1
+    usable = (arr_i32.size // channels) * channels
+    deck = arr_i32[:usable].reshape(-1, channels)
+    best = 0
+    for ch in range(channels):
+        nz = deck[:, ch][deck[:, ch] != 0].astype(np.int64)
+        if nz.size < 500:
+            continue
+        tz = np.log2((nz & -nz).astype(np.float64)).astype(np.int64)   # exact trailing zeros
+        counts = np.bincount(tz, minlength=33)
+        threshold = max(8, int(nz.size * _BD_ACTIVE_FRAC))
+        cum = np.cumsum(counts)
+        eff = 32 - int(np.argmax(cum >= threshold))
+        best = max(best, eff)
+    return best
+
+
+def _noise_floor_profile(arr_i32: "np.ndarray", channels: int, sample_rate: int) -> "dict | None":
+    """Expose the noise floor underneath the music, if the master has any quiet.
+
+    Returns a dict {floor_db, peak_db, flat, slope_db} or None when the window is
+    unusable. ``floor_db`` is the 1.5th-percentile broadband RMS over 100 ms blocks
+    (full scale = 1.0); ``flat`` flags a white/TPDF-shaped floor (the 16-bit dither
+    tell) vs. an LF-heavy analog floor; ``slope_db`` = HF-band minus LF-band level
+    of the quietest blocks.
+    """
+    if not _NUMPY_OK or sample_rate < 8000:
+        return None
+    usable = (arr_i32.size // max(1, channels)) * max(1, channels)
+    if usable < sample_rate:
+        return None
+    mono = arr_i32[:usable].reshape(-1, max(1, channels)).astype(np.float64).mean(axis=1) / (2.0 ** 31)
+    block = sample_rate // 10
+    n = len(mono) // block
+    if n < 20:
+        return None
+    blocks = mono[: n * block].reshape(n, block)
+    rms = np.sqrt(np.mean(blocks * blocks, axis=1))
+    rms = rms[rms > 0]
+    if rms.size < 20:
+        return None
+    floor_lin = float(np.percentile(rms, 1.5))
+    peak_lin = float(np.percentile(rms, 99))
+    if floor_lin <= 0:
+        return None
+    floor_db = 20.0 * math.log10(floor_lin)
+    peak_db = 20.0 * math.log10(peak_lin) if peak_lin > 0 else 0.0
+
+    # Spectral colour of the quietest 10% of blocks (noise-floor dominated).
+    order = np.argsort(rms)
+    quiet_idx = order[: max(3, n // 10)]
+    quiet = blocks[quiet_idx] * np.hanning(block)
+    spec = np.mean(np.abs(np.fft.rfft(quiet, axis=1)) ** 2, axis=0)
+    freqs = np.fft.rfftfreq(block, 1.0 / sample_rate)
+    lf = spec[(freqs > 150) & (freqs < 2000)]
+    hf = spec[(freqs > sample_rate * 0.33) & (freqs < sample_rate * 0.45)]
+    slope_db = float("nan")
+    flat = False
+    if lf.size and hf.size and lf.mean() > 0 and hf.mean() > 0:
+        slope_db = 10.0 * math.log10(hf.mean() / lf.mean())
+        flat = abs(slope_db) < _BD_FLOOR_FLAT_TOL_DB
+    return {"floor_db": floor_db, "peak_db": peak_db, "flat": flat, "slope_db": slope_db}
+
+
+def check_bit_depth_authenticity(filepath: Path, claimed_depth: int, duration_sec: float = 0.0,
+                                 sample_rate: int = 0, channels: int = 0) -> str:
+    """Two-prong effective-bit-depth forensics.
 
     Decodes a 30 s window (from the middle of the track — intros/outros are often
-    quiet or faded) as 32-bit PCM and measures how many low-order bits actually
-    carry signal. A genuine 24-bit master uses all 24 (dither alone guarantees a
-    live LSB); 16-bit content zero-padded into a 24-bit container leaves the bottom
-    8 bits dead in every single sample. Robust to stray corrupt samples: a bit rank
-    must be exercised by at least 0.01% of samples to count.
+    quiet or faded) as interleaved-stereo 32-bit PCM (never mono-downmixed: averaging
+    L+R injects a half-LSB and corrupts the bit pattern) and runs two independent
+    tests:
+
+    Prong 1 — used bits. The lowest bit rank actually exercised reveals clean
+    integer zero-padding: 16-bit content shifted into a 24-bit container leaves the
+    bottom 8 bits dead in every sample. Per-channel, robust to stray samples. This
+    is a *proof* of padding when it fires, but it is BLIND to dithered/float/lossy
+    upscales, whose low bits go live (so "all bits used" must NOT be reported as a
+    confident "verified 24-bit" — that overclaims).
+
+    Prong 2 — noise floor / effective dynamic range. The only signal that sees
+    through a dithered upscale, but bounded by physics: a 16-bit step is detectable
+    only when the source genuinely holds content below the 16-bit dither floor
+    (-93 dBFS). On loud masters with no exposed floor the prong ABSTAINS (the honest
+    answer); when a quiet passage exists it either CONFIRMS genuine >16-bit content
+    (floor < -99 dBFS) or flags an effective-16-bit ceiling (a flat/white floor
+    sitting right at -93 dBFS under a >16-bit container).
     """
     if not claimed_depth: return ""
     if not _NUMPY_OK: return f"claimed {claimed_depth}-bit — numpy unavailable, not verified"
@@ -464,22 +577,70 @@ def check_bit_depth_authenticity(filepath: Path, claimed_depth: int, duration_se
         return f"claimed {claimed_depth}-bit — decode failed, not verified"
 
     arr = np.frombuffer(result.stdout[: len(result.stdout) // 4 * 4], dtype=np.int32)
-    nz = arr[arr != 0].astype(np.int64)
-    if nz.size < 1000:
+    nz_total = int(np.count_nonzero(arr))
+    if nz_total < 1000:
         return f"claimed {claimed_depth}-bit — sampled window is silent, not verified"
 
-    tz = np.log2((nz & -nz).astype(np.float64)).astype(np.int64)   # trailing zeros, exact
-    counts = np.bincount(tz, minlength=33)
-    threshold = max(10, nz.size // 10000)                           # ≥0.01% of samples
-    cum = np.cumsum(counts)
-    effective_bits = 32 - int(np.argmax(cum >= threshold))
+    # Caller passes the probed channel count; fall back to interleave detection
+    # (both lanes populated under a stereo assumption => stereo, else mono).
+    if channels < 1:
+        channels = 2 if arr.size >= 2 and np.count_nonzero(arr[1::2]) > 0 else 1
+    effective_bits = _effective_bits(arr, channels)
 
-    if effective_bits >= claimed_depth:
-        return f"✓ Verified {claimed_depth}-bit — all {claimed_depth} bits in active use"
-    elif effective_bits <= claimed_depth - 8:
-        return f"⚠ Upscaled: {claimed_depth}-bit container but only {effective_bits} bits carry signal — padded from {effective_bits}-bit source"
-    else:
-        return f"~ {effective_bits} of {claimed_depth} bits in use — bit-shifted gain or fixed-point processing chain"
+    if sample_rate < 8000:
+        # Last-resort rate estimate from the byte count (a full 30 s clip). The floor
+        # LEVEL is sample-rate independent, so this only affects block sizing.
+        span = min(30.0, duration_sec) if duration_sec else 30.0
+        est = (arr.size / max(1, channels)) / span if span > 0 else 44100
+        sample_rate = min((44100, 48000, 88200, 96000, 176400, 192000, 22050),
+                          key=lambda r: abs(r - est))
+    prof = _noise_floor_profile(arr, channels, sample_rate)
+    return _bit_depth_verdict(claimed_depth, effective_bits, prof)
+
+
+def _bit_depth_verdict(claimed_depth: int, effective_bits: int, prof: "dict | None") -> str:
+    """Pure verdict logic for the two prongs (separated for unit testing).
+
+    ``effective_bits`` is the deepest bit rank exercised (Prong 1); ``prof`` is the
+    noise-floor profile from ``_noise_floor_profile`` or None when unmeasurable.
+    """
+    # Prong 1: a clean integer pad (low bits hard-zero) is conclusive.
+    if effective_bits and effective_bits <= claimed_depth - 8:
+        return (f"⚠ Upscaled: {claimed_depth}-bit container but only {effective_bits} bits carry "
+                f"signal — clean integer pad from a {effective_bits}-bit source")
+    if effective_bits and effective_bits < claimed_depth:
+        return (f"~ {effective_bits} of {claimed_depth} bits exercised — reduced-depth master, "
+                f"bit-shifted gain, or fixed-point chain (not zero-padded)")
+
+    # Prong 2: bits are fully live. "All bits used" alone does NOT prove the source
+    # depth (a dithered/float upscale fills them too) — consult the noise floor.
+    if prof is None:
+        return f"✓ {claimed_depth}-bit container fully exercised — source depth not independently confirmable"
+    floor, flat = prof["floor_db"], prof["flat"]
+
+    # No exposed floor (loud master) -> abstain honestly.
+    if floor > _BD_FLOOR_EXPOSED_DBFS:
+        return (f"✓ {claimed_depth}-bit container fully exercised — noise floor masked by a loud "
+                f"master ({floor:.0f} dBFS), source depth not independently confirmable")
+
+    # Floor proves content below the 16-bit dither floor -> genuine high-res.
+    if floor < _BD_GENUINE_HIRES_DBFS:
+        eff_dr = max(claimed_depth, int(round((-floor - 1.76) / 6.02)))
+        return (f"✓ Genuine {claimed_depth}-bit — noise floor at {floor:.0f} dBFS confirms content "
+                f"below the 16-bit limit (~{eff_dr}-bit dynamic range)")
+
+    # Floor is exposed but sits in 16-bit territory (-102 .. -86 dBFS).
+    eff_dr = int(round((-floor - 1.76) / 6.02))
+    if claimed_depth >= 24 and flat and floor <= _BD_16BIT_LEVEL_MAX_DBFS:
+        # Flat/white floor right at the 16-bit dither level = the TPDF tell.
+        return (f"⚠ Effective ~16-bit — {claimed_depth}-bit container but a flat noise floor at "
+                f"{floor:.0f} dBFS (the 16-bit dither level) — upsampled from 16-bit")
+    if claimed_depth >= 24:
+        colour = "colored/analog" if not flat else "limited dynamic range"
+        return (f"~ Noise floor {floor:.0f} dBFS (~{eff_dr}-bit effective, {colour}) — consistent with "
+                f"an analog-sourced or heavily-compressed {claimed_depth}-bit master; source depth unconfirmable")
+    # claimed 16-bit (or 20) with a floor at the 16-bit level == consistent.
+    return f"✓ {claimed_depth}-bit consistent — noise floor at {floor:.0f} dBFS matches the claimed depth"
 
 # --- Byproduct metrics: computed from the SpectralEngine's decoded audio.
 #     Replaces three full ffmpeg invocations (aphasemeter, astats clipping,
@@ -1938,7 +2099,7 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
         f_loud = pool.submit(extract_loudness, filepath)
         f_sox = pool.submit(extract_sox_stats, filepath)
         f_spec = pool.submit(generate_spectrogram, filepath, tech.duration_sec)
-        f_bits = pool.submit(check_bit_depth_authenticity, filepath, claimed_depth, tech.duration_sec)
+        f_bits = pool.submit(check_bit_depth_authenticity, filepath, claimed_depth, tech.duration_sec, sample_rate, channels)
         spectral = engine.analyse(max_seconds=fast_secs, status=lambda s: _Status.update(name, s))
         _Status.update(name, "waiting on loudness/spectrogram")
         lp, dr = f_loud.result()
@@ -2294,16 +2455,17 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     if auth.vinyl_rip_detected: source_flags.append("vinyl")
     bd_text = auth.bit_depth_authentic
     # Any transcode/upsample chain repopulates the low-order bits (float decode +
-    # re-quantization, or resampling interpolation), so the trailing-zero pass is
-    # blind to the source depth. Don't render it as a confident green "Verified"
-    # pass — that contradicts the lossy/upscale finding above. Keyed on its own
-    # broad condition (resample OR fake-hi-res OR a decided lossy verdict) so a
-    # green "Verified" never appears on a file the engine already called fake,
-    # independent of the bandwidth detector's own thresholds.
+    # re-quantization, or resampling interpolation), so used-bits analysis is blind
+    # to the source depth and the noise floor (if exposed at all) is the encoder's,
+    # not the source's. Don't render a green pass — that contradicts the lossy/upscale
+    # finding above. Keyed on its own broad condition (resample OR fake-hi-res OR a
+    # decided lossy verdict) so a green never appears on a file the engine already
+    # called fake, independent of the bit-depth prongs' own thresholds.
     bits_regenerated = bool(sp and bd_text.startswith("✓") and (
         sp.resample_detected or sp.fake_hires or sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY")))
     if bits_regenerated:
-        depth = bd_text.split(" — ")[0].replace("✓ Verified ", "")
+        m = re.search(r"(\d+)-bit", bd_text)
+        depth = f"{m.group(1)}-bit" if m else "Claimed depth"
         bd_text = f"~ {depth} container full, but source depth unverifiable on a transcoded/upsampled stream"
     bd_col = (C.RED if bd_text.startswith("⚠") else C.GREEN if bd_text.startswith("✓")
               else C.ORANGE if bits_regenerated else C.WHITE)
