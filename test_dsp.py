@@ -397,6 +397,65 @@ check("verdict: full bits + colored floor -> analog tilde (no false ⚠)", _bit_
 check("verdict: 16-bit claim + flat 16-bit floor -> consistent ✓", _bit_depth_verdict(16, 16, FLAT16).startswith("✓ 16-bit consistent"))
 check("verdict: no profile -> honest unconfirmable", "not independently confirmable" in _bit_depth_verdict(24, 24, None))
 
+print("\n== 20. MDCT quantization-error detector (Derrien JAES 2019) ==")
+engM = make_engine("mdct.flac")
+# 20a: MDCT/IMDCT-style fold reconstructs via DCT-IV orthonormality (round-trip of a
+# single block through the analysis fold + DCT-IV is a real, finite, info-preserving map)
+N2 = 2048
+win = engM._kbd_window(N2)
+# KBD satisfies the Princen-Bradley condition w[n]^2 + w[n+N]^2 == 1 (perfect recon)
+half = win[:N2 // 2]
+pb = half ** 2 + win[N2 // 2:] ** 2
+check("KBD window satisfies Princen-Bradley (w^2+w^2=1)", np.allclose(pb, 1.0, atol=1e-9),
+      f"max dev {np.max(np.abs(pb - 1.0)):.2e}")
+# 20b: a batch MDCT returns N coefficients for a 2N input
+blk = np.random.RandomState(1).randn(3, N2)
+coeffs = engM._mdct_batch(blk, win)
+check("MDCT maps 2N samples -> N coefficients", coeffs.shape == (3, 1024), f"shape {coeffs.shape}")
+# 20c: gamma thresholds are positive and increase with band width K (E~K/12 scaling)
+P = 0.01
+swb = np.asarray(SpectralEngine._SWB_LONG_44_48, float)
+K = np.diff(swb)
+mu, sigma = K / 12.0, np.sqrt(K / 180.0)
+from scipy.special import ndtr, ndtri
+gam = mu + sigma * ndtri(P + (1.0 - P) * ndtr(-mu / sigma))
+check("gamma thresholds positive and rise with band width", (gam > 0).all() and gam[-1] > gam[0],
+      f"gam[0]={gam[0]:.2f} gam[-1]={gam[-1]:.2f}")
+# 20d: genuine wideband white noise (no MDCT lattice) reads LOW (well below the 0.10 wall)
+rs = np.random.RandomState(7)
+gen = rs.randn(SR * 6).astype(np.float32) * 0.2
+Lg = engM._mdct_quant_error(gen, rs.randn(SR * 6).astype(np.float32) * 0.2)
+check("genuine white noise -> low MDCT score (< 0.10)", 0 <= Lg < 0.10, f"L={Lg:.3f}")
+# 20e: a signal whose MDCT coefficients sit exactly on an integer lattice (a perfect
+# synthetic transcode) reads HIGH. Build it directly in the coefficient domain: pick a
+# block grid, set integer-scaled coefficients, IMDCT, overlap-add with TDAC.
+def imdct_overlap(coeffs_blocks, w, scale):
+    N = 1024
+    nblk = coeffs_blocks.shape[0]
+    out = np.zeros(N * (nblk + 1), dtype=np.float64)
+    for i in range(nblk):
+        p = _sidct4(coeffs_blocks[i] * scale)                 # folded length-N
+        # transpose of the forward fold (PR synthesis) -> windowed 2N frame
+        frame = np.empty(N2)
+        frame[:N // 2] = p[N // 2:N]
+        frame[N // 2:N] = -p[N // 2:N][::-1]
+        frame[N:N + N // 2] = -p[:N // 2][::-1]
+        frame[N + N // 2:] = -p[:N // 2]
+        out[i * N:i * N + N2] += frame * w
+    return out
+from scipy.fft import idct as _sidct
+_sidct4 = lambda c: _sidct(c, type=4, norm='ortho')
+rs2 = np.random.RandomState(11)
+cb = np.round(rs2.randn(SR * 6 // 1024, 1024) * 6.0)          # integer coefficient lattice
+lattice = imdct_overlap(cb, win, scale=80.0).astype(np.float32) / 32768.0
+Lt = engM._mdct_quant_error(lattice, None)
+check("integer MDCT-coefficient lattice -> higher than genuine noise", Lt > Lg + 0.03,
+      f"L_lattice={Lt:.3f} vs L_gen={Lg:.3f}")
+# 20f: rate gate — 96k container is out of the swb table's scope -> n/a (-1)
+eng96 = SpectralEngine(Path("x96.flac"), 96000, channels=2)
+check("non-44.1/48k rate -> detector returns -1 (n/a)",
+      eng96._mdct_quant_error(gen, None) == -1.0)
+
 # ---------------------------------------------------------------------------
 failed = [n for n, ok, _ in _results if not ok]
 print(f"\n{'=' * 60}\n{len(_results) - len(failed)}/{len(_results)} checks passed.")

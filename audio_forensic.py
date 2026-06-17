@@ -29,7 +29,9 @@ except ImportError:
 try:
     from scipy import signal as _sps
     from scipy.fft import rfft as _srfft, irfft as _sirfft, rfftfreq as _srfftfreq, next_fast_len as _next_fast_len
+    from scipy.fft import dct as _sdct
     from scipy.ndimage import uniform_filter1d as _uniform1d
+    from scipy.special import ndtr as _ndtr, ndtri as _ndtri
     _SCIPY_OK = True
 except ImportError:
     _SCIPY_OK = False
@@ -82,6 +84,7 @@ class _Status:
         "resample check": 0.28,
         "header integrity": 0.29, "psychoacoustic tests": 0.30, "cassette profile": 0.41,
         "segment voting": 0.55, "silence & vinyl analysis": 0.57, "auCDtect statistics": 0.63,
+        "mdct quantization": 0.70,
         "waiting on loudness/spectrogram": 0.80, "finalizing": 0.97,
     }
 
@@ -212,6 +215,7 @@ class SpectralAnalysis:
     auc_avg_bound_freq: float = 0.0; auc_bound_interp: str = ""
     auc_prob_bound_freq: float = 0.0
     auc_phase_entropy: float = 0.0; auc_phase_interp: str = ""
+    mdct_quant_score: float = -1.0; mdct_quant_interp: str = ""
     scipy_available: bool = True
 
 @dataclass
@@ -1452,6 +1456,142 @@ class SpectralEngine:
         return score, reasons, preecho_pct, aliasing_corr, mp3_noise_pattern
 
     # -----------------------------------------------------------------------
+    # MDCT quantization-error detector (Derrien, JAES 2019) — high-bitrate backstop
+    # -----------------------------------------------------------------------
+    # AAC scalefactor-band offsets for the long (1024-coeff) window, fs index 3/4
+    # (48 kHz and 44.1 kHz share this 49-band table). ISO/IEC 14496-3.
+    _SWB_LONG_44_48 = (
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108,
+        120, 132, 144, 160, 176, 196, 216, 240, 264, 292, 320, 352, 384, 416, 448,
+        480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896, 928, 1024)
+
+    def _kbd_window(self, n2: int, alpha: float = 4.0) -> "np.ndarray":
+        """Kaiser-Bessel-Derived analysis window of length n2 (the AAC long-window
+        shape; ffmpeg's AAC encoder uses KBD). Cached per length."""
+        cache = getattr(self, "_kbd_cache", None)
+        if cache is None:
+            cache = self._kbd_cache = {}
+        if n2 in cache:
+            return cache[n2]
+        m = n2 // 2
+        k = _sps.windows.kaiser(m + 1, math.pi * alpha)
+        cs = np.cumsum(k)
+        rising = np.sqrt(cs[:m] / cs[m])
+        win = np.concatenate([rising, rising[::-1]]).astype(np.float64)
+        cache[n2] = win
+        return win
+
+    def _mdct_batch(self, frames2n: "np.ndarray", win: "np.ndarray") -> "np.ndarray":
+        """MDCT of a batch of length-2N frames -> N coefficients each, via the
+        Princen-Bradley time-domain-aliasing fold followed by an orthonormal DCT-IV."""
+        n = frames2n.shape[1] // 2
+        x = frames2n * win
+        a, b = x[:, : n // 2], x[:, n // 2 : n]
+        c, d = x[:, n : n + n // 2], x[:, n + n // 2 :]
+        folded = np.concatenate([-c[:, ::-1] - d, a - b[:, ::-1]], axis=1)
+        return _sdct(folded, type=4, norm="ortho", axis=1, workers=-1)
+
+    def _mdct_quant_error(self, mid: "np.ndarray", side: "np.ndarray | None") -> float:
+        """Derrien's blind genuine-lossless test. A lossy AAC encoder rounds scaled
+        MDCT coefficients to integers; re-applying the same MDCT + scaling + rounding
+        to an already-transcoded signal yields near-zero error, whereas genuine
+        lossless audio yields the usual U[-1/2,1/2] quantization error. Per AAC
+        scalefactor band we measure the rounding-error energy E and count bands where
+        E < gamma (gamma set so genuine P(E<gamma)=0.01). c = fraction of flagged
+        bands, averaged over high-energy anchor frames at a shared block-grid phase;
+        the returned L is the max c over channels, scalefactor levels and phases.
+        Transcoded => high L (AAC256 ~0.18, AAC320 ~0.13); genuine => low L (<0.04).
+
+        This is the backstop for high-bitrate AAC transcodes that keep full bandwidth
+        and so leave no lowpass wall for the cutoff/void/fingerprint rules to catch.
+        Only meaningful at 44.1/48 kHz (the swb table is rate-specific). Returns -1
+        when not applicable (wrong rate, too short)."""
+        sr = self.sample_rate
+        if sr not in (44100, 48000):
+            return -1.0
+        N, N2 = 1024, 2048
+        swb = np.asarray(self._SWB_LONG_44_48, dtype=int)
+        seg_starts, counts = swb[:-1], np.diff(swb)
+        K = counts.astype(float)
+        # gamma(K): truncated-normal (on [0, inf)) quantile so genuine P(E<gamma)=P.
+        # E = sum of K squared-uniform errors -> mean K/12, var K/180 by the CLT.
+        P = 0.01
+        mu, sigma = K / 12.0, np.sqrt(K / 180.0)
+        lo = _ndtr(-mu / sigma)
+        gam = mu + sigma * _ndtri(P + (1.0 - P) * lo)
+
+        # AAC quantizer/dead-zone constants assume ~16-bit integer PCM scale
+        cap_n = int(self.TIME_DOMAIN_CAP_S * sr)
+        mid = np.ascontiguousarray(mid[:cap_n], dtype=np.float64) * 32768.0
+        if len(mid) < N2 * 4:
+            return -1.0
+        channels = [("M", mid)]
+        if side is not None:
+            channels.append(("S", np.ascontiguousarray(side[:cap_n], dtype=np.float64) * 32768.0))
+
+        win = self._kbd_window(N2)
+        n_anchors, n_sf, phase_step = 16, 8, 8
+        phases = np.arange(0, N, phase_step)
+
+        # Pick high-energy, well-separated anchor positions from the mid channel
+        hop = N
+        npos = (len(mid) - N2) // hop
+        if npos < 2:
+            return -1.0
+        csq = np.concatenate(([0.0], np.cumsum(mid * mid)))   # window energies via prefix sums
+        starts = np.arange(npos) * hop
+        eblk = csq[starts + N2] - csq[starts]
+        # Digital silence rounds every coefficient to zero -> every band flags -> a
+        # spurious L=1. Require the loudest anchor to carry real signal (RMS > -70 dBFS
+        # at 16-bit scale; 32768*10^(-70/20) ~= 10 -> mean-square ~= N2*100).
+        if float(eblk.max()) < N2 * 100.0:
+            return -1.0
+        anchors = []
+        for idx in np.argsort(eblk)[::-1]:
+            pos = int(idx) * hop
+            base = pos - N // 2
+            if base < 0 or base + (N - 1) + N2 > len(mid):
+                continue
+            if all(abs(pos - p) > N2 for p in anchors):
+                anchors.append(pos)
+            if len(anchors) >= n_anchors:
+                break
+        if not anchors:
+            return -1.0
+
+        bestL = 0.0
+        for _name, sig in channels:
+            windows = np.empty((len(anchors) * len(phases), N2), dtype=np.float64)
+            for ai, a in enumerate(anchors):
+                base = a - N // 2
+                for pi, phi in enumerate(phases):
+                    windows[ai * len(phases) + pi] = sig[base + phi : base + phi + N2]
+            X = np.abs(self._mdct_batch(windows, win))
+            maxX = np.maximum(np.maximum.reduceat(X, seg_starts, axis=1), 1e-12)
+            sdz = 16.0 + (4.0 / 3.0) * np.log2(maxX)          # dead-zone scalefactor (Eq. 2)
+            smin, smax = 0.3 * sdz, 0.7 * sdz                  # 90% of real AAC scalefactors
+            Xp = X ** 0.75                                      # AAC ^0.75 power-law quantizer
+            c_sf_phase = np.zeros((n_sf, len(phases)))
+            for i_sf in range(n_sf):
+                frac = i_sf / (n_sf - 1) if n_sf > 1 else 0.0
+                s_band = smin + frac * (smax - smin)
+                scale_bins = np.repeat(2.0 ** (-3.0 * s_band / 16.0), counts, axis=1)
+                xsc = Xp * scale_bins
+                eps = np.round(xsc) - xsc
+                E = np.add.reduceat(eps * eps, seg_starts, axis=1)
+                c = (E < gam[None, :]).mean(axis=1)
+                c_sf_phase[i_sf] = c.reshape(len(anchors), len(phases)).mean(axis=0)
+            bestL = max(bestL, float(c_sf_phase.max()))
+        return bestL
+
+    @staticmethod
+    def _interp_mdct(score: float) -> str:
+        if score < 0: return "n/a (only 44.1/48 kHz)"
+        if score < 0.06: return "✓ no MDCT quantization lattice — clean coefficient statistics"
+        if score < 0.10: return "~ faint coefficient clustering"
+        return "⚠ MDCT quantization lattice — AAC transcode signature"
+
+    # -----------------------------------------------------------------------
     # Rule 11 — analogue cassette source profiler (false-positive bypass)
     # -----------------------------------------------------------------------
     def _cassette_source(self, audio: "np.ndarray", frames: "np.ndarray", bins: "np.ndarray",
@@ -2030,6 +2170,24 @@ class SpectralEngine:
                 main += 15
                 lossy_ev.append(f"Fake HF Noise Injection: ultrasonic band is statistically independent of the music (corr {ultra:.2f}) while organic scatter dies at {auc_avg:,.0f} Hz — noise pasted above a codec wall.")
 
+            # Rule: MDCT quantization-error lattice (Derrien JAES 2019) — the backstop
+            # for high-bitrate AAC transcodes that keep full bandwidth and so leave no
+            # lowpass wall for any cutoff/void/fingerprint rule to catch. Blind, no
+            # reference, near-zero false-positive (genuine masters read < 0.04; AAC 256
+            # ~0.18, AAC 320 ~0.13). Skip analog/DSD sources — only AAC's exact MDCT
+            # grid produces the lattice, and the swb table is 44.1/48 kHz only.
+            if (not self.native_dsd and not vinyl_detected and not cassette_detected
+                    and self.sample_rate in (44100, 48000)):
+                st("mdct quantization")
+                mdct_L = self._mdct_quant_error(audio, side)
+                result.mdct_quant_score = mdct_L
+                if mdct_L >= 0.10:
+                    main += 55
+                    lossy_ev.append(f"MDCT Quantization Lattice: scaled MDCT coefficients re-round to integers across {mdct_L * 100:.0f}% of scalefactor bands (genuine lossless < 4%) — the fingerprint of an AAC encoder's quantizer surviving in 'lossless' PCM, with no lowpass wall to betray it.")
+                elif mdct_L >= 0.06:
+                    main += 15
+                    lossy_ev.append(f"Faint MDCT Coefficient Clustering: a weak integer-rounding lattice in the MDCT domain (strength {mdct_L:.3f}) — possible high-bitrate transcode.")
+
         main = max(0, min(100, main))
         label, sentence, caveats = self._verdict(main, net_score, cutoff_hz, dsd_detected, cassette_detected, vinyl_detected,
                                                  resampled_from=result.resample_src_rate, fake_hires=result.fake_hires)
@@ -2054,6 +2212,7 @@ class SpectralEngine:
         result.hf_env_corr_interp = self._interp_ultra_corr(result.hf_envelope_correlation)
         result.auc_bound_interp = self._interp_bound(result.auc_avg_bound_freq)
         result.auc_phase_interp = self._interp_phase_entropy(result.auc_phase_entropy, legit_cutoff)
+        result.mdct_quant_interp = self._interp_mdct(result.mdct_quant_score)
         result.verdict_label, result.primary_verdict = label, sentence
         result.evidence, result.natural_evidence, result.caveats = lossy_ev, natural_ev, caveats
         return result
@@ -2228,6 +2387,12 @@ def _phase_ent_colour(e: float) -> str:
 def _sparsity_colour(s: float) -> str:
     if s < 0.05: return C.GREEN
     if s < 0.30: return C.WHITE
+    return C.ORANGE
+
+def _mdct_colour(s: float) -> str:
+    if s < 0: return C.GREY
+    if s < 0.06: return C.GREEN
+    if s < 0.10: return C.WHITE
     return C.ORANGE
 
 def _ultra_corr_colour(c: float) -> str:
@@ -2413,6 +2578,7 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
                 _kv("Segment Vote", seg_val),
                 _kv("auCDtect Bound", _c(_bound_colour(sp.auc_avg_bound_freq), f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode") + "  " + _c(C.GREY, sp.auc_bound_interp)),
                 _kv("HF Phase Entropy", _c(_phase_ent_colour(sp.auc_phase_entropy), f"{sp.auc_phase_entropy:.2f} bits") + "  " + _c(C.GREY, sp.auc_phase_interp)),
+                _kv("MDCT Quant. Lattice", _c(_mdct_colour(sp.mdct_quant_score), ("n/a" if sp.mdct_quant_score < 0 else f"{sp.mdct_quant_score:.3f}")) + "  " + _c(C.GREY, sp.mdct_quant_interp)) if sp.mdct_quant_score != -1.0 or sp.scipy_available else "",
                 _kv("Spectral Sparsity", _c(_sparsity_colour(sp.spectral_sparsity), f"{sp.spectral_sparsity:.3f}") + "  " + _c(C.GREY, sp.sparsity_interp)),
                 _kv("Ultrasonic Corr.", _c(_ultra_corr_colour(sp.hf_envelope_correlation), f"{sp.hf_envelope_correlation:+.2f}") + "  " + _c(C.GREY, sp.hf_env_corr_interp)),
                 _kv("Pre-Echo", _c(_preecho_colour(sp.preecho_pct), f"{sp.preecho_pct:.1f}% of transients") + "  " + _c(C.GREY, "[MDCT block smearing]")),

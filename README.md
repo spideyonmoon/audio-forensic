@@ -73,6 +73,7 @@ both 44.1 and 48 kHz:
 |--------|--------|
 | MP3 64–320 kbps | **88–100 LIKELY_LOSSY** (all bitrates, both sample rates) |
 | AAC 96–192 kbps | **88–100 LIKELY_LOSSY** |
+| AAC 256–320 kbps (full bandwidth, no wall) | **55 SUSPICIOUS** (MDCT quantization-error detector) |
 | Opus 64–192 kbps | **88 LIKELY_LOSSY** (every bitrate — CELT 20 kHz fingerprint) |
 | Vorbis q2–q4 | **91–100 LIKELY_LOSSY** |
 | 24/96 master → MP3 320 → 24-bit ALAC | **88 LIKELY_LOSSY** |
@@ -80,9 +81,18 @@ both 44.1 and 48 kHz:
 | Half-genuine / half-MP3 splice | **45 CAUTION** + walled regions listed with timestamps |
 | Genuine / dark master / vinyl / cassette / mono controls | **0 GENUINE** (zero false positives) |
 
-Known limits: AAC ≥256 kbps and Vorbis q6+ encode pink noise at full bandwidth and
-are spectrally invisible on synthetic fixtures — real music leaves more artifacts,
-but treat "transparent-bitrate AAC" as detectable only sometimes.
+High-bitrate AAC (256/320 kbps) keeps full bandwidth and leaves no lowpass wall, so
+the cutoff-based detectors are blind to it. These are now caught by a **MDCT
+quantization-error detector** (Derrien, JAES 2019): an AAC encoder rounds scaled MDCT
+coefficients to integers, and that rounding is *idempotent* — re-running the same MDCT
+on the decoded "lossless" PCM reproduces near-zero error across many scalefactor bands,
+a fingerprint genuine lossless never shows. Blind, no reference, zero false positives by
+construction.
+
+Known limits: HE-AAC/AAC+ (SBR) and AAC with TNS regenerate or reshape the high band, so
+no MDCT grid lines up — they evade the quant-error test. Vorbis q6+ and high-bitrate Opus
+use different MDCT grids/windows and keep full bandwidth, so transparent-bitrate Vorbis
+remains the main open gap.
 
 ## How it works — the forensic suite
 
@@ -113,6 +123,10 @@ One ffmpeg decode and one cached STFT feed every detector. Highlights:
   silence too.
 - **Psychoacoustic artifacts** — pre-echo (MDCT smearing), filterbank aliasing
   correlation, the MP3 32-band 689 Hz subband comb.
+- **MDCT quantization-error lattice** — the high-bitrate AAC backstop. Re-applies the
+  AAC analysis MDCT to the decoded PCM; if scaled coefficients re-round to integers
+  across many scalefactor bands, an AAC quantizer's fingerprint is baked into the
+  "lossless" file even though it kept full bandwidth with no wall to betray it.
 - **Anti-forensics exposure** — fake ultrasonic noise injected above a codec wall is
   caught by envelope-correlation + scatter-collapse cross-checks.
 - **Analog vetoes** — vinyl (random, stable hiss + click transients) and cassette
