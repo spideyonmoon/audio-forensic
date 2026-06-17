@@ -54,13 +54,44 @@ class C:
     BLUE    = "\033[38;5;110m"
 
 def _c(colour: str, text: str) -> str: return f"{colour}{text}{C.RESET}"
-def _kv(key: str, value: str, *, width: int = 26) -> str: return f"  {_c(C.CYAN, key.ljust(width))} {_c(C.WHITE, value)}" if value else ""
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+def _visible(s: str) -> str: return _ANSI_RE.sub("", s).strip()  # text with ANSI colour codes removed
+def _kv(key: str, value: str, *, width: int = 26) -> str: return f"  {_c(C.CYAN, key.ljust(width))} {_c(C.WHITE, value)}" if _visible(value) else ""
 def _rule(char: str = "─", width: int = 62) -> str: return _c(C.GREY, char * width)
 def _section(title: str) -> str: pad = max(0, 58 - len(title)); return f"\n{_c(C.GREY, '── ')}{_c(C.GOLD + C.BOLD, title)}{_c(C.GREY, ' ' + '─' * pad)}"
 def _subsection(title: str) -> str: return f"\n  {_c(C.GREY, title)}"
 def _camel_case(text: str) -> str:
     words = re.sub(r"[^a-zA-Z0-9 ]", "", text).split()
     return words[0].lower() + "".join(w.capitalize() for w in words[1:]) if words else ""
+
+# Status-gutter rows for the forensic detector lists: a left ✓/⚠/✗ column lets the
+# eye scan the margin for what fired, passed checks recede in dim grey, and flagged
+# rows stay bright. Status drives glyph, colour, and whether the row dims.
+#   ok   = a check that passed (dimmed)        warn = anomaly (orange ⚠)
+#   data = neutral measurement (white)         caut = borderline (yellow ⚠)
+#   info = analog/contextual note (blue →)     bad  = strong lossy flag (red ✗)
+_STATUS = {
+    "bad":  (C.RED,    "✗"), "warn": (C.ORANGE, "⚠"), "caut": (C.YELLOW, "⚠"),
+    "info": (C.BLUE,   "→"), "ok":   (C.GREEN,  "✓"), "data": (C.GREY,   " "),
+}
+_COL_STATUS = {C.RED: "bad", C.ORANGE: "warn", C.YELLOW: "caut", C.GREEN: "ok", C.BLUE: "info"}
+def _stat(col: str) -> str: return _COL_STATUS.get(col, "data")
+def _interp(text: str) -> str: return _c(C.DIM + C.GREY, text) if text else ""
+def _degl(text: str) -> str: return re.sub(r"^[✓⚠✗~→•]\s*", "", text)  # gutter shows the glyph now
+
+def _mrow(key: str, main: str, interp: str = "", status: str = "data", *, kw: int = 22) -> str:
+    """One detector row: gutter glyph + key + value (+ dim interp). Passed rows recede."""
+    if not main and not interp: return ""
+    gcol, gch = _STATUS.get(status, _STATUS["data"])
+    dim = status == "ok"
+    gutter = _c((C.DIM + gcol) if dim else gcol, gch)
+    keytxt = _c((C.DIM + C.GREY) if dim else C.CYAN, key.ljust(kw))
+    if dim:
+        body = _c(C.DIM + C.GREY, main + (f"   {interp}" if interp else ""))
+    else:
+        vcol = {"data": C.WHITE, "bad": C.RED, "warn": C.ORANGE, "caut": C.YELLOW, "info": C.BLUE}[status]
+        body = _c(vcol, main) + (f"   {_interp(interp)}" if interp else "")
+    return f"  {gutter} {keytxt} {body}"
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -2485,9 +2516,50 @@ def _sox_amplitude_colour(key: str, raw: str) -> str:
     except ValueError: return C.WHITE
     return C.WHITE
 
+_VERDICT_GLYPH = {"GENUINE": "✓", "LIKELY_GENUINE": "✓", "CAUTION": "~", "SUSPICIOUS": "⚠", "LIKELY_LOSSY": "✗"}
+_VERDICT_COL = {"GENUINE": C.GREEN, "LIKELY_GENUINE": C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE, "LIKELY_LOSSY": C.RED}
+
+def _print_banner(report: ForensicReport, sz: Optional[float]) -> None:
+    """Executive summary at the very top — verdict, headline finding, and the key
+    specs in the first six lines, so the conclusion lands before the detail does."""
+    sp, tec, lp = report.authenticity.spectral, report.technical, report.loudness
+    lbl = "VERDICT".ljust(9)
+    if sp and sp.verdict_label not in ("", "INCONCLUSIVE"):
+        vcol = _VERDICT_COL.get(sp.verdict_label, C.WHITE)
+        glyph = _VERDICT_GLYPH.get(sp.verdict_label, "·")
+        filled = max(0, min(10, int(sp.net_confidence_pct / 10)))
+        bar = _c(vcol, "█" * filled) + _c(C.GREY, "░" * (10 - filled))
+        head = f"{glyph} {sp.verdict_label.replace('_', ' ')}"
+        score = _c(_main_score_colour(sp.main_score), f"{sp.main_score}/100")
+        print(f"  {_c(C.GREY, lbl)}{_c(vcol + C.BOLD, head)}  {_c(C.GREY, '·')}  {score}   {bar}")
+        if sp.primary_verdict:
+            print(f"  {' ' * 9}{_c(vcol, sp.primary_verdict)}")
+    else:
+        verdict = report.authenticity.spectral_cutoff_verdict or "INCONCLUSIVE"
+        print(f"  {_c(C.GREY, lbl)}{_c(C.WHITE, verdict)}")
+    specs = [s for s in (tec.sample_encoding, _hz_label(tec.sample_rate) if tec.sample_rate else "",
+                         _channel_label(tec.channels) if tec.channels else "", tec.duration,
+                         f"{sz:.1f} MB" if sz is not None else "") if s]
+    if specs:
+        print(f"  {_c(C.GREY, 'FILE'.ljust(9))}{_c(C.WHITE, '  ·  '.join(specs))}")
+    loud = []
+    if report.dr_score and report.dr_score != "N/A": loud.append(_c(_dr_assessment(report.dr_score)[0], report.dr_score))
+    if lp.lufs_integrated: loud.append(_c(_lufs_colour(lp.lufs_integrated), f"{lp.lufs_integrated} LUFS"))
+    if lp.true_peak_dbtp: loud.append(_c(_peak_colour(lp.true_peak_dbtp), f"{lp.true_peak_dbtp} dBTP"))
+    elif lp.peak_db: loud.append(_c(_peak_colour(lp.peak_db), f"peak {_db(lp.peak_db)}"))
+    if loud:
+        print(f"  {_c(C.GREY, 'LOUDNESS'.ljust(9))}{_c(C.GREY, '  ·  ').join(loud)}")
+    if sp and sp.verdict_label not in ("", "INCONCLUSIVE"):
+        nl, nn = len(sp.evidence), len(sp.natural_evidence)
+        genuine = sp.verdict_label in ("GENUINE", "LIKELY_GENUINE")
+        sig = _c(C.GREY if (genuine or not nl) else C.ORANGE, f"⚠ {nl} lossy") + _c(C.GREY, "  ·  ") + _c(C.GREEN if nn else C.GREY, f"✓ {nn} natural")
+        print(f"  {_c(C.GREY, 'SIGNALS'.ljust(9))}{sig}")
+
 def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None) -> None:
     t, tec, lp, auth, sz = report.tags, report.technical, report.loudness, report.authenticity, file_size_mb if file_size_mb is not None else report.file_size_mb
     W = 62; print(); print(_rule("═", W)); print(f"  {_c(C.BOLD + C.WHITE, report.filepath.name)}"); print(_rule("═", W))
+    print()
+    _print_banner(report, sz)
     print(_section("IDENTITY"))
     for row in [_kv("Duration", tec.duration), _kv("BPM", t.bpm), _kv("File Size", f"{sz:.1f} MB")]:
         if row: print(row)
@@ -2529,71 +2601,66 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     print(_subsection("Spectral Analysis  (numpy FFT engine)"))
     sp = auth.spectral
     if sp and sp.verdict_label != "INCONCLUSIVE":
-        conf_filled  = int(sp.net_confidence_pct / 10); conf_empty = 10 - conf_filled
-        verdict_col  = {"GENUINE": C.GREEN, "LIKELY_GENUINE":C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE, "LIKELY_LOSSY": C.RED}.get(sp.verdict_label, C.WHITE)
-        conf_bar = _c(verdict_col, "█" * conf_filled) + _c(C.GREY, "░" * conf_empty)
-        print(f"  {conf_bar} {_c(verdict_col + C.BOLD, sp.primary_verdict)}")
-        print(f"  {_c(_main_score_colour(sp.main_score), f'Main Score: {sp.main_score}/100')}  {_c(C.GREY, '(0 = pristine lossless · 100 = certain transcode)')}")
-        print(f"  {_c(C.GREY, f'Base engine: Lossy {sp.lossy_score} − Natural {sp.natural_score} = Net {sp.net_score}/{sp.max_score}  |  Raw Error Rate: {sp.raw_lossy_pct:.1f}%')}")
+        print(f"  {_c(C.GREY, f'Main score {sp.main_score}/100  ·  base engine: lossy {sp.lossy_score} − natural {sp.natural_score} = net {sp.net_score}/{sp.max_score}  ·  raw error {sp.raw_lossy_pct:.1f}%')}")
+        print(f"  {_c(C.DIM + C.GREY, '0 = pristine lossless   ·   100 = certain transcode')}")
         print()
         rows_spec = [
-            _kv("Ultrasonic Noise", _c(C.ORANGE, "⚠ DSD/SACD Transcode Profile") if sp.dsd_detected else _c(C.GREEN, "✓ Normal")),
-            _kv("HF Cutoff",         sp.cutoff_hz_str),
-            _kv("Cutoff Variance",   f"{sp.cutoff_variance:.1f} Hz²  " + _c(C.GREY, sp.cutoff_variance_interp)),
-            _kv("Cliff Sharpness",   f"{sp.cutoff_sharpness_db:.1f} dB/bin · {sp.cliff_depth_db:.0f} dB drop/800Hz  " + _c(C.GREY, sp.cutoff_sharpness_interp)),
-            _kv("HF Energy Ratio",   f"{sp.hf_energy_ratio:.5f}  " + _c(C.GREY, sp.hf_energy_interp)),
-            _kv("Side Anomaly",      f"{sp.side_anomaly_score:.3f}  " + _c(C.GREY, sp.side_interp)),
-            _kv("Banding Score",     f"{sp.banding_score:.3f}  " + _c(C.GREY, sp.banding_interp)),
-            _kv("NF Above Cutoff",   f"{sp.nf_above_cutoff_db:.1f} dB  " + _c(C.GREY, sp.nf_interp)),
-            _kv("LPF",              ("⚠ YES — " + sp.lpf_cutoff_str) if sp.lpf_detected else "✓ None detected"),
-            _kv("Spectral Entropy", f"{sp.entropy:.3f}  " + _c(C.GREY, sp.entropy_interp)),
+            _mrow("Ultrasonic Noise", "DSD/SACD transcode profile", "", "warn") if sp.dsd_detected else _mrow("Ultrasonic Noise", "Normal", "", "ok"),
+            _mrow("HF Cutoff",        sp.cutoff_hz_str, "", "data"),
+            _mrow("Cutoff Variance",  f"{sp.cutoff_variance:.1f} Hz²", sp.cutoff_variance_interp, "data"),
+            _mrow("Cliff Sharpness",  f"{sp.cutoff_sharpness_db:.1f} dB/bin · {sp.cliff_depth_db:.0f} dB drop/800Hz", sp.cutoff_sharpness_interp, "data"),
+            _mrow("HF Energy Ratio",  f"{sp.hf_energy_ratio:.5f}", sp.hf_energy_interp, "data"),
+            _mrow("Side Anomaly",     f"{sp.side_anomaly_score:.3f}", sp.side_interp, "data"),
+            _mrow("Banding Score",    f"{sp.banding_score:.3f}", sp.banding_interp, "data"),
+            _mrow("NF Above Cutoff",  f"{sp.nf_above_cutoff_db:.1f} dB", sp.nf_interp, "data"),
+            _mrow("LPF", f"detected — {sp.lpf_cutoff_str}", "", "warn") if sp.lpf_detected else _mrow("LPF", "none detected", "", "ok"),
+            _mrow("Spectral Entropy", f"{sp.entropy:.3f}", sp.entropy_interp, "data"),
         ]
         for row in rows_spec:
             if row: print(row)
 
         print(_subsection("Advanced DSP Forensics  (scipy suite)"))
         if sp.scipy_available:
-            if sp.segment_walled < 0: seg_val = _c(C.GREY, "n/a — file too short for 7-segment voting")
+            if sp.segment_walled < 0: seg = _mrow("Segment Vote", "n/a — file too short for 7-segment voting", "", "data")
             else:
                 seg_majority = sp.segment_walled > sp.segment_total / 2
-                seg_col = C.RED if seg_majority else (C.YELLOW if sp.segment_walled > 0 else C.GREEN)
-                seg_state = "✗ FAILED" if seg_majority else ("~ partial walls" if sp.segment_walled > 0 else "✓ passed")
-                seg_val = _c(seg_col, f"{seg_state} — {sp.segment_walled}/{sp.segment_total} clips walled ≤{sp.segment_wall_hz / 1000:.1f} kHz")
-            if sp.silence_ratio < 0: sil_val = _c(C.GREY, "n/a — no silent passages ≥ 0.5s found")
-            else: sil_val = _c(_silence_ratio_colour(sp.silence_ratio), f"{sp.silence_ratio:.3f}") + "  " + _c(C.GREY, "[<0.15 clean · >0.3 codec hash in silence]")
-            if sp.vinyl_noise_detected: vinyl_val = _c(C.BLUE, f"✓ surface noise detected ({sp.vinyl_clicks_per_min:.0f} clicks/min)")
-            else: vinyl_val = _c(C.GREY, "not detected")
-            if sp.cassette_score >= 30: cass_val = _c(C.BLUE, f"✓ tape profile matched (score {sp.cassette_score}/80)")
-            elif sp.cassette_score > 0: cass_val = _c(C.GREY, f"weak match (score {sp.cassette_score}/80)")
-            else: cass_val = _c(C.GREY, "not detected")
+                seg_st = "bad" if seg_majority else ("caut" if sp.segment_walled > 0 else "ok")
+                seg_state = "failed" if seg_majority else ("partial walls" if sp.segment_walled > 0 else "passed")
+                seg = _mrow("Segment Vote", f"{seg_state} — {sp.segment_walled}/{sp.segment_total} clips walled ≤{sp.segment_wall_hz / 1000:.1f} kHz", "", seg_st)
+            if sp.silence_ratio < 0: sil = _mrow("Silence Dither", "n/a — no silent passages ≥ 0.5s found", "", "data")
+            else: sil = _mrow("Silence Dither", f"{sp.silence_ratio:.3f}", "[<0.15 clean · >0.3 codec hash in silence]", _stat(_silence_ratio_colour(sp.silence_ratio)))
+            if sp.vinyl_noise_detected: vinyl = _mrow("Vinyl Source", f"surface noise detected ({sp.vinyl_clicks_per_min:.0f} clicks/min)", "", "info")
+            else: vinyl = _mrow("Vinyl Source", "not detected", "", "data")
+            if sp.cassette_score >= 30: cass = _mrow("Cassette Source", f"tape profile matched (score {sp.cassette_score}/80)", "", "info")
+            elif sp.cassette_score > 0: cass = _mrow("Cassette Source", f"weak match (score {sp.cassette_score}/80)", "", "data")
+            else: cass = _mrow("Cassette Source", "not detected", "", "data")
             hdr_mm = sp.header_duration_mismatch or sp.header_bitrate_mismatch
-            fp_val = _c(C.RED, f"⚠ {sp.codec_fingerprint} wall profile") if sp.codec_fingerprint else _c(C.GREEN, "✓ cutoff matches no known encoder wall")
-            if sp.resample_detected: res_val = _c(C.RED, f"⚠ {sp.resample_detected}")
-            elif sp.fake_hires: res_val = _c(C.ORANGE, f"⚠ fake hi-res — {sp.fake_hires} (upsampled; codec lowpass erased the Nyquist tell)")
-            else: res_val = _c(C.GREEN, "✓ no foreign-Nyquist resampler artifacts")
+            hdr = _mrow("Header Integrity", "header/stream mismatch — forged or truncated", "", "bad") if hdr_mm else _mrow("Header Integrity", "container matches decoded stream", "", "ok")
+            fp = _mrow("Codec Fingerprint", f"{sp.codec_fingerprint} wall profile", "", "bad") if sp.codec_fingerprint else _mrow("Codec Fingerprint", "cutoff matches no known encoder wall", "", "ok")
+            if sp.resample_detected: res = _mrow("Resample Check", sp.resample_detected, "", "bad")
+            elif sp.fake_hires: res = _mrow("Resample Check", f"fake hi-res — {sp.fake_hires}", "(upsampled; codec lowpass erased the Nyquist tell)", "warn")
+            else: res = _mrow("Resample Check", "no foreign-Nyquist resampler artifacts", "", "ok")
+            mdct = ""
+            if sp.mdct_quant_score != -1.0 or sp.scipy_available:
+                mdct = _mrow("MDCT Quant. Lattice", "n/a" if sp.mdct_quant_score < 0 else f"{sp.mdct_quant_score:.3f}", sp.mdct_quant_interp, _stat(_mdct_colour(sp.mdct_quant_score)))
             rows_adv = [
-                _kv("Header Integrity", _c(C.RED, "⚠ header/stream mismatch — forged or truncated") if hdr_mm else _c(C.GREEN, "✓ container matches decoded stream")),
-                _kv("Codec Fingerprint", fp_val),
-                _kv("Resample Check", res_val),
-                _kv("Segment Vote", seg_val),
-                _kv("auCDtect Bound", _c(_bound_colour(sp.auc_avg_bound_freq), f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode") + "  " + _c(C.GREY, sp.auc_bound_interp)),
-                _kv("HF Phase Entropy", _c(_phase_ent_colour(sp.auc_phase_entropy), f"{sp.auc_phase_entropy:.2f} bits") + "  " + _c(C.GREY, sp.auc_phase_interp)),
-                _kv("MDCT Quant. Lattice", _c(_mdct_colour(sp.mdct_quant_score), ("n/a" if sp.mdct_quant_score < 0 else f"{sp.mdct_quant_score:.3f}")) + "  " + _c(C.GREY, sp.mdct_quant_interp)) if sp.mdct_quant_score != -1.0 or sp.scipy_available else "",
-                _kv("Spectral Sparsity", _c(_sparsity_colour(sp.spectral_sparsity), f"{sp.spectral_sparsity:.3f}") + "  " + _c(C.GREY, sp.sparsity_interp)),
-                _kv("Ultrasonic Corr.", _c(_ultra_corr_colour(sp.hf_envelope_correlation), f"{sp.hf_envelope_correlation:+.2f}") + "  " + _c(C.GREY, sp.hf_env_corr_interp)),
-                _kv("Pre-Echo", _c(_preecho_colour(sp.preecho_pct), f"{sp.preecho_pct:.1f}% of transients") + "  " + _c(C.GREY, "[MDCT block smearing]")),
-                _kv("HF Aliasing Corr.", _c(_aliasing_colour(sp.aliasing_corr), f"{sp.aliasing_corr:.2f}") + "  " + _c(C.GREY, "[codec filterbank mirroring]")),
-                _kv("MP3 Subband Comb", _c(C.ORANGE, "⚠ 689 Hz comb structure detected") if sp.mp3_noise_pattern_detected else _c(C.GREEN, "✓ none")),
-                _kv("Silence Dither", sil_val),
-                _kv("Vinyl Source", vinyl_val),
-                _kv("Cassette Source", cass_val),
+                hdr, fp, res, seg,
+                _mrow("auCDtect Bound", f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode", sp.auc_bound_interp, _stat(_bound_colour(sp.auc_avg_bound_freq))),
+                _mrow("HF Phase Entropy", f"{sp.auc_phase_entropy:.2f} bits", sp.auc_phase_interp, _stat(_phase_ent_colour(sp.auc_phase_entropy))),
+                mdct,
+                _mrow("Spectral Sparsity", f"{sp.spectral_sparsity:.3f}", sp.sparsity_interp, _stat(_sparsity_colour(sp.spectral_sparsity))),
+                _mrow("Ultrasonic Corr.", f"{sp.hf_envelope_correlation:+.2f}", sp.hf_env_corr_interp, _stat(_ultra_corr_colour(sp.hf_envelope_correlation))),
+                _mrow("Pre-Echo", f"{sp.preecho_pct:.1f}% of transients", "[MDCT block smearing]", _stat(_preecho_colour(sp.preecho_pct))),
+                _mrow("HF Aliasing Corr.", f"{sp.aliasing_corr:.2f}", "[codec filterbank mirroring]", _stat(_aliasing_colour(sp.aliasing_corr))),
+                _mrow("MP3 Subband Comb", "689 Hz comb structure detected", "", "warn") if sp.mp3_noise_pattern_detected else _mrow("MP3 Subband Comb", "none", "", "ok"),
+                sil, vinyl, cass,
             ]
             for row in rows_adv:
                 if row: print(row)
             if sp.segment_map:
-                print(f"    {_c(C.ORANGE, '⚠ Partially transcoded regions:')}")
+                print(f"\n    {_c(C.ORANGE, '⚠ Partially transcoded regions')}")
                 for seg_line in sp.segment_map[:6]:
-                    print(f"      {_c(C.GREY, '→')} {_c(C.WHITE, seg_line)}")
+                    print(f"      {_c(C.ORANGE, '→')} {_c(C.WHITE, seg_line)}")
         else:
             print(f"  {_c(C.YELLOW, '⚠ scipy not installed — advanced forensic suite skipped (pip install scipy)')}")
 
@@ -2633,16 +2700,26 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
         m = re.search(r"(\d+)-bit", bd_text)
         depth = f"{m.group(1)}-bit" if m else "Claimed depth"
         bd_text = f"~ {depth} container full, but source depth unverifiable on a transcoded/upsampled stream"
-    bd_col = (C.RED if bd_text.startswith("⚠") else C.GREEN if bd_text.startswith("✓")
-              else C.ORANGE if bits_regenerated else C.WHITE)
-    bd_val = _c(bd_col, bd_text)
     if bits_regenerated:
-        bd_val += _c(C.GREY, " — interpolation/requantization regenerates the low-order bits")
-    for row in [_kv("Bit-Depth Auth", bd_val), _kv("Header Integrity", auth.header_integrity), _kv("Encoder Trace", _c(C.RED, auth.encoder_trace) if auth.encoder_trace else ""), _kv("MQA", _c(C.ORANGE, "⚠ MQA-encoded — folded payload not verifiable by PCM analysis") if auth.mqa_detected else ""), _kv("Analog Source", _c(C.BLUE, " + ".join(source_flags) + " signature detected") if source_flags else ""), _kv("Side Channel", auth.side_channel_analysis), _kv("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}" if auth.phase_correlation else ""), _kv("Clipping", auth.clipping_verdict if auth.clipping_verdict else ""), _kv("Silence", auth.silence_total_pct)]:
+        bd_status, bd_interp = "warn", "interpolation/requantization regenerates the low-order bits"
+    elif bd_text.startswith("⚠"): bd_status, bd_interp = "bad", ""
+    elif bd_text.startswith("✓"): bd_status, bd_interp = "ok", ""
+    else: bd_status, bd_interp = "data", ""
+    si_rows = [_mrow("Bit-Depth Auth", _degl(bd_text), bd_interp, bd_status)]
+    hi = auth.header_integrity
+    if hi: si_rows.append(_mrow("Header Integrity", _degl(hi), "", "ok" if hi.startswith("✓") else "data"))
+    if auth.encoder_trace: si_rows.append(_mrow("Encoder Trace", auth.encoder_trace, "", "bad"))
+    if auth.mqa_detected: si_rows.append(_mrow("MQA", "MQA-encoded — folded payload not verifiable by PCM analysis", "", "warn"))
+    if source_flags: si_rows.append(_mrow("Analog Source", " + ".join(source_flags) + " signature detected", "", "info"))
+    if auth.side_channel_analysis: si_rows.append(_mrow("Side Channel", auth.side_channel_analysis, "", "data"))
+    if auth.phase_correlation: si_rows.append(_mrow("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}", "", "data"))
+    if auth.clipping_verdict: si_rows.append(_mrow("Clipping", _degl(auth.clipping_verdict), "", "ok" if auth.clipping_verdict.startswith("✓") else "warn"))
+    if auth.silence_total_pct: si_rows.append(_mrow("Silence", auth.silence_total_pct, "", "data"))
+    for row in si_rows:
         if row: print(row)
     if auth.silence_sections:
-        for s in auth.silence_sections[:4]: print(f"    {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")
-        if len(auth.silence_sections) > 4: print(f"    {_c(C.GREY, f'... +{len(auth.silence_sections)-4} more sections')}")
+        for s in auth.silence_sections[:4]: print(f"      {_c(C.GREY, '→')} {_c(C.DIM + C.WHITE, s)}")
+        if len(auth.silence_sections) > 4: print(f"      {_c(C.GREY, f'… +{len(auth.silence_sections)-4} more sections')}")
 
     print(_subsection("ReplayGain Audit"))
     if auth.rg_stored:
