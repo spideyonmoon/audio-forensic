@@ -43,6 +43,8 @@ pip install -r requirements.txt   # numpy + scipy
 
 python audio_forensic.py "track.flac"          # full forensic report
 python audio_forensic.py *.flac                # batch an album (live ETA, summary table)
+python audio_forensic.py ./album_dir           # scan a directory for audio files
+python audio_forensic.py a.flac b.mp3 --compare # rank variants of one track, pick the best
 python audio_forensic.py track.flac --json     # machine-readable output
 python audio_forensic.py track.flac --fast     # first 60 s only
 python audio_forensic.py track.flac --info     # metadata only, no DSP
