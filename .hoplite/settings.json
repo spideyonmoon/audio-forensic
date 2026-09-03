@@ -7,7 +7,7 @@
 	"scripts": {
 		"setup": {
 			"enabled": true,
-			"command": "command -v sox >/dev/null && command -v mediainfo >/dev/null && command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q sox mediainfo ffmpeg; }; python3 -c 'import numpy, scipy' 2>/dev/null || pip3 install -q --break-system-packages -r requirements.txt"
+			"command": "{ command -v sox >/dev/null && command -v mediainfo >/dev/null && command -v ffmpeg >/dev/null && command -v git-lfs >/dev/null; } || { sudo apt-get update -q && sudo apt-get install -y -q sox mediainfo ffmpeg git-lfs; }; python3 -c 'import numpy, scipy' 2>/dev/null || pip3 install -q --break-system-packages -r requirements.txt"
 		},
 		"run": {
 			"enabled": true,
