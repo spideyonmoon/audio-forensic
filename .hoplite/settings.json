@@ -1,0 +1,26 @@
+{
+	"version": 1,
+	"ports": {
+		"preview": 3000,
+		"additional": {}
+	},
+	"scripts": {
+		"setup": {
+			"enabled": true,
+			"command": "command -v sox >/dev/null && command -v mediainfo >/dev/null && command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q sox mediainfo ffmpeg; }; python3 -c 'import numpy, scipy' 2>/dev/null || pip3 install -q --break-system-packages -r requirements.txt"
+		},
+		"run": {
+			"enabled": true,
+			"command": null
+		},
+		"archive": {
+			"enabled": true,
+			"command": null
+		},
+		"check": {
+			"enabled": true,
+			"command": null
+		}
+	},
+	"mcpServers": []
+}

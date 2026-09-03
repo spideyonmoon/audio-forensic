@@ -78,6 +78,7 @@ _COL_STATUS = {C.RED: "bad", C.ORANGE: "warn", C.YELLOW: "caut", C.GREEN: "ok", 
 def _stat(col: str) -> str: return _COL_STATUS.get(col, "data")
 def _interp(text: str) -> str: return _c(C.DIM + C.GREY, text) if text else ""
 def _degl(text: str) -> str: return re.sub(r"^[✓⚠✗~→•]\s*", "", text)  # gutter shows the glyph now
+def _ellipsize(text: str, limit: int) -> str: return text if len(text) <= limit else f"{text[: limit - 1]}…"
 
 def _mrow(key: str, main: str, interp: str = "", status: str = "data", *, kw: int = 22) -> str:
     """One detector row: gutter glyph + key + value (+ dim interp). Passed rows recede."""
@@ -761,6 +762,22 @@ def audit_replaygain(tags: AudioTags, lufs_integrated: str) -> tuple[str, str, s
     except (ValueError, IndexError): return stored_raw, lufs_integrated, "", ""
 
 
+_SPEC_OUTPUT_LOCK = threading.Lock()
+_CLAIMED_SPEC_OUTPUTS: "set[Path]" = set()
+
+def _spectrogram_output_path(filepath: Path) -> Path:
+    """Output name unique per input. Batch runs analyse files concurrently and two
+    files can share a stem (Disc 1/song.flac alongside Disc 2/song.flac) — without
+    this the second writer clobbers the first's PNG mid-render."""
+    with _SPEC_OUTPUT_LOCK:
+        out = filepath.with_name(f"{filepath.stem}_spectrogram.png")
+        n = 2
+        while out in _CLAIMED_SPEC_OUTPUTS:
+            out = filepath.with_name(f"{filepath.stem}_{n}_spectrogram.png")
+            n += 1
+        _CLAIMED_SPEC_OUTPUTS.add(out)
+        return out
+
 def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Optional[Path]:
     """Generates a clean mono spectrogram (SoX rendering — best visual quality).
 
@@ -776,7 +793,7 @@ def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Optional[
     1280 px width. NB: plain seconds only — a bare ``s`` suffix means *samples*
     in SoX time syntax, and ``"240.0s"`` is an outright parse error.
     """
-    output = filepath.with_name(f"{filepath.stem}_spectrogram.png")
+    output = _spectrogram_output_path(filepath)
 
     decode = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(filepath), "-vn",
@@ -2784,8 +2801,13 @@ def print_batch_summary(reports: list[ForensicReport]) -> None:
         nf = r.loudness.noise_floor_db; nf_s = _c(_noise_colour(nf), f"{nf} dB".ljust(col_w[3]) if nf else "---".ljust(col_w[3]))
         sp = r.authenticity.spectral
         ms_s = _c(_main_score_colour(sp.main_score), str(sp.main_score).ljust(col_w[4])) if sp and sp.verdict_label != "INCONCLUSIVE" else "--".ljust(col_w[4])
-        verdict = r.authenticity.spectral_cutoff_verdict or "—"; vshort = verdict[:26]
-        print(f"  {_c(C.WHITE, name)} {dr} {lufs_s} {nf_s} {ms_s} {_c(C.DIM + C.WHITE, vshort)}")
+        verdict = r.authenticity.spectral_cutoff_verdict or "—"
+        if sp and sp.verdict_label and sp.verdict_label != "INCONCLUSIVE":
+            glyph = _VERDICT_GLYPH.get(sp.verdict_label, "·"); vcol = _VERDICT_COL.get(sp.verdict_label, C.WHITE)
+            verdict = _c(vcol, f"{glyph} {sp.verdict_label.replace('_', ' ')}")
+        else:
+            verdict = _c(C.DIM + C.WHITE, _ellipsize(verdict, 30))
+        print(f"  {_c(C.WHITE, name)} {dr} {lufs_s} {nf_s} {ms_s} {verdict}")
     print(_rule("─", W))
     drs = []
     for r in reports:
@@ -2894,6 +2916,23 @@ def print_comparison(reports: list[ForensicReport]) -> None:
     print(f"  {_c(C.DIM + C.WHITE, 'Ranking assumes these are variants of the SAME track; unrelated files produce a meaningless order.')}")
     print()
 
+def _analyse_guarded(filepath: Path, fast_secs: Optional[float] = None) -> tuple[Optional[ForensicReport], Optional[str]]:
+    """Analyse one file without letting a hard failure abort the batch. Decode
+    failures are already handled inside the pipeline; this catches the rest and
+    reports them to the caller (stderr + non-zero exit) instead of a traceback."""
+    try:
+        return build_report(filepath, fast_secs=fast_secs), None
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        _Status.done(filepath.name)
+        return None, str(exc) or type(exc).__name__
+
+def _undecodable(report: ForensicReport) -> bool:
+    """The file exists but no audio could be pulled out of it."""
+    sp = report.authenticity.spectral
+    return sp is not None and sp.verdict_label == "INCONCLUSIVE" and sp.primary_verdict == "Could not decode audio"
+
 def main() -> None:
     # Windows pipes default to cp1252, which cannot encode the report's box-drawing
     # and verdict glyphs — redirecting output would crash with UnicodeEncodeError.
@@ -2937,22 +2976,44 @@ def main() -> None:
     if args.compare and len(paths) < 2:
         print("Error: --compare needs at least 2 files to rank", file=sys.stderr); sys.exit(1)
 
-    if args.info:
-        reports = [build_info_report(p) for p in paths]
-        if args.json: print(json.dumps([_report_to_dict(r) for r in reports], indent=2, default=str))
+    reports: list[ForensicReport] = []
+    failed: list[tuple[str, str]] = []
+    try:
+        if args.info:
+            for p in paths:
+                try:
+                    reports.append(build_info_report(p))
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    failed.append((p.name, str(exc) or type(exc).__name__))
         else:
-            for report in reports: print_report(report)
-        return
+            fast = 60.0 if args.fast else None
+            workers = args.workers if args.workers > 0 else min(3, os.cpu_count() or 1)
+            _Status.begin(len(paths), workers if len(paths) > 1 else 1)
+            if len(paths) > 1 and workers > 1:
+                pool = ThreadPoolExecutor(max_workers=workers)
+                try:
+                    pairs = list(pool.map(lambda p: _analyse_guarded(p, fast), paths))
+                finally:
+                    # Don't wait for in-flight files when the user hits Ctrl-C.
+                    pool.shutdown(wait=False, cancel_futures=True)
+            else:
+                pairs = [_analyse_guarded(p, fast) for p in paths]
+            _Status.clear()
+            for p, (r, err) in zip(paths, pairs):
+                if err is not None:
+                    failed.append((p.name, err))
+                elif r is not None:
+                    reports.append(r)
+    except KeyboardInterrupt:
+        _Status.clear()
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(130)
 
-    fast = 60.0 if args.fast else None
-    workers = args.workers if args.workers > 0 else min(3, os.cpu_count() or 1)
-    _Status.begin(len(paths), workers if len(paths) > 1 else 1)
-    if len(paths) > 1 and workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            reports = list(pool.map(lambda p: build_report(p, fast_secs=fast), paths))
-    else:
-        reports = [build_report(p, fast_secs=fast) for p in paths]
-    _Status.clear()
+    for name, err in failed:
+        print(f"Error: failed to analyse {name}: {err}", file=sys.stderr)
+
     if args.json:
         if args.compare:
             ordered = sorted(reports, key=_compare_key)
@@ -2961,6 +3022,8 @@ def main() -> None:
             print(json.dumps(payload, indent=2, default=str))
         else:
             print(json.dumps([_report_to_dict(r) for r in reports], indent=2, default=str))
+        if failed or (reports and all(_undecodable(r) for r in reports)):
+            sys.exit(2)
         return
 
     for report in reports: print_report(report)
@@ -2968,6 +3031,11 @@ def main() -> None:
         print_comparison(reports)
     elif len(reports) > 1:
         print_batch_summary(reports)
+
+    # A run that produced nothing analysable is a failure, not a success — scripts
+    # key off the exit code, and "Could not decode audio" currently exits 0.
+    if failed or (reports and all(_undecodable(r) for r in reports)):
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()
