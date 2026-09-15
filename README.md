@@ -10,7 +10,7 @@
 
 Detects fake lossless files (lossy transcodes hiding in FLAC/ALAC/WAV containers)
 with an 11-rule DSP forensic engine, measured codec fingerprints, and a unified
-0–100 Main Score — calibrated so genuine mastered audio never gets falsely flagged.
+0–100 Main Score. Detection is heuristic: genuine mastering can resemble codec artifacts.
 
 </div>
 
@@ -51,16 +51,17 @@ python audio_forensic.py track.flac --info     # metadata only, no DSP
 python audio_forensic.py *.flac --workers 4    # batch concurrency (default: auto, ≤3)
 ```
 
-A 4-minute FLAC analyzes in ~3–5 s. A live status line shows the current stage,
+Analysis time depends on track length, CPU, and enabled transform searches. A live status line shows the current stage,
 a progress bar, and a self-calibrating ETA.
 
 ## The Main Score (0–100)
 
-Every detector feeds one number. 0 = pristine lossless, 100 = certain transcode.
+Every detector feeds one heuristic evidence score. Higher scores indicate stronger
+transcode indicators; the score is not a calibrated probability or proof of provenance.
 
 | Score | Verdict | Meaning |
 |-------|---------|---------|
-| 0–10 | **GENUINE** | Strong evidence of authentic lossless source |
+| 0–10 | **GENUINE** | No strong lossy indicators detected; source history unverified |
 | 11–30 | **LIKELY_GENUINE** | Consistent with genuine lossless |
 | 31–54 | **CAUTION** | Minor spectral quirks — possibly legitimate |
 | 55–85 | **SUSPICIOUS** | Strong lossy indicators — probable transcode |
@@ -88,17 +89,23 @@ the cutoff-based detectors are blind to it. These are now caught by a **MDCT
 quantization-error detector** (Derrien, JAES 2019): an AAC encoder rounds scaled MDCT
 coefficients to integers, and that rounding is *idempotent* — re-running the same MDCT
 on the decoded "lossless" PCM reproduces near-zero error across many scalefactor bands,
-a fingerprint genuine lossless never shows. Blind, no reference, zero false positives by
-construction.
+a possible codec fingerprint. Silent channels, inactive anchors, and unpopulated
+bands are excluded: zeros also re-round perfectly in genuine audio. This is a blind
+heuristic, not a guarantee of zero false positives.
 
 Known limits: HE-AAC/AAC+ (SBR) and AAC with TNS regenerate or reshape the high band, so
-no MDCT grid lines up — they evade the quant-error test. Vorbis q6+ and high-bitrate Opus
-use different MDCT grids/windows and keep full bandwidth, so transparent-bitrate Vorbis
-remains the main open gap.
+no MDCT grid lines up — they evade the AAC quant-error test. A separate Vorbis-window
+search now detects persistent transform-grid zeros in controlled q4/q6/q8/q10
+stereo fixtures at 44.1/48 kHz, including conversion to 24-bit FLAC. It currently
+models common 2048/256-sample blocks and allows long-block alignment to shift
+after short blocks. Transition windows themselves, other block sizes,
+post-processing, noise/dither, and resampling can hide the trace. A
+negative result does not exclude Vorbis or Opus ancestry. Ogg is a container;
+this new test targets Vorbis, not every codec Ogg can carry.
 
 ## How it works — the forensic suite
 
-One ffmpeg decode and one cached STFT feed every detector. Highlights:
+One ffmpeg decode feeds a cached STFT plus targeted MDCT searches. Highlights:
 
 - **Segment voting (9 clips)** — 2 s clips spread across the file, each checked for a
   frequency wall; majority = whole-file lossy ancestry (+55). The wall threshold is
@@ -129,6 +136,16 @@ One ffmpeg decode and one cached STFT feed every detector. Highlights:
   AAC analysis MDCT to the decoded PCM; if scaled coefficients re-round to integers
   across many scalefactor bands, an AAC quantizer's fingerprint is baked into the
   "lossless" file even though it kept full bandwidth with no wall to betray it.
+- **Vorbis transform grid** — tests reconstructed L/R channels with the
+  [Vorbis I window](https://www.xiph.org/vorbis/doc/Vorbis_I_spec.html), searching
+  every sample alignment over up to 12 clips within the first 180 seconds. A
+  repeated excess of near-zero coefficients on alignments sharing a 128-sample
+  short-hop grid, compared with equally searched off-grid transforms, sets a
+  minimum score of 55. This handles long-block phase shifts after transient-driven
+  short blocks; stationary-noise fixtures alone missed that requirement. At least four clips and
+  half the active clips must support the pattern. Background-relative gates
+  reject tested tones and mastering lowpasses. This is provisional transform-codec
+  evidence, not a unique encoder identification or a measured probability.
 - **Anti-forensics exposure** — fake ultrasonic noise injected above a codec wall is
   caught by envelope-correlation + scatter-collapse cross-checks.
 - **Analog vetoes** — vinyl (random, stable hiss + click transients) and cassette
@@ -167,9 +184,20 @@ album summary table with DR/LUFS/score per track and DR-outlier warnings.
 
 ## Verification
 
+See [accuracy change notes](ACCURACY_NOTES.md) for detector design, regression
+results, real-file observations, and remaining limits.
+
 ```bash
-python test_dsp.py   # 42 self-contained synthetic-signal checks, no audio files needed
+python -X utf8 test_dsp.py   # 79 synthetic DSP checks, no audio files needed
+python -X utf8 -m unittest -v test_accuracy   # accuracy regressions + optional FFmpeg encodes
+python -X utf8 -m unittest -v test_vorbis    # Vorbis-to-24-bit-FLAC matrix, transient switching + genuine controls
 ```
+
+The accuracy regressions cover dual mono, quiet side channels, tones, silence,
+transients, and AAC 256/320 kbps at 44.1/48 kHz. The AAC fixtures disable TNS;
+they verify this detector's supported case. These controlled checks do not measure
+precision or recall on real music. Corpus-level accuracy still needs independently
+sourced lossless masters and matched transcodes, including difficult negative controls.
 
 ## License
 

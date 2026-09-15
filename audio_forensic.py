@@ -247,6 +247,9 @@ class SpectralAnalysis:
     auc_prob_bound_freq: float = 0.0
     auc_phase_entropy: float = 0.0; auc_phase_interp: str = ""
     mdct_quant_score: float = -1.0; mdct_quant_interp: str = ""
+    vorbis_grid_score: float = -1.0; vorbis_grid_support: int = 0
+    vorbis_grid_tested: int = 0; vorbis_grid_channel: str = ""
+    vorbis_grid_interp: str = "not evaluated"
     scipy_available: bool = True
 
 @dataclass
@@ -1526,6 +1529,78 @@ class SpectralEngine:
         folded = np.concatenate([-c[:, ::-1] - d, a - b[:, ::-1]], axis=1)
         return _sdct(folded, type=4, norm="ortho", axis=1, workers=-1)
 
+    def _vorbis_grid(self, mid: "np.ndarray", side: "np.ndarray | None") -> tuple[float, int, int, str]:
+        """Search for persistent numerical zeros on a Vorbis long-block grid.
+
+        Uses the Vorbis I sine-of-sine-squared window (Xiph specification 1.3.2)
+        with common 2048/256-sample long/short blocks. Score is excess zero-
+        coefficient fraction over median off-grid occupancy. Long-block runs
+        share alignment modulo the 128-sample short hop, not the 1024 long hop:
+        intervening short blocks shift the long-block phase in real music.
+        It is a heuristic, not a codec identity test or a calibrated probability.
+        Transition windows themselves, added noise, resampling and other block sizes
+        can erase it. Search every sample phase to tolerate trimming/delay.
+        """
+        if not _SCIPY_OK or self.sample_rate not in (44100, 48000):
+            return -1.0, 0, 0, ""
+        size, hop = 2048, 1024
+        limit = int(self.TIME_DOMAIN_CAP_S * self.sample_rate)
+        mid = mid[:limit]
+        if len(mid) < size * 8:
+            return -1.0, 0, 0, ""
+        window = np.sin(np.pi / 2 * np.sin(np.pi * (np.arange(size) + 0.5) / size) ** 2)
+        # Stay inside the audible band: a codec/mastering lowpass must not be
+        # mistaken for transform quantization. Off-grid comparison also rejects
+        # spectral gaps that persist at every alignment (tones, dark masters).
+        lo = int(1000 * size / self.sample_rate)
+        hi = int(19000 * size / self.sample_rate)
+        positions = np.linspace(size, len(mid) - 2 * size, 12).astype(int) // hop * hop
+        positions = np.unique(positions)
+        best = (-1.0, 0, 0, "")
+        # Reconstruct L/R: Vorbis coupling is not ordinary M/S. Averaging L/R
+        # fills quantized zeros and hides high-quality encodes from a mid test.
+        for channel in (("L", "R") if side is not None else ("M",)):
+            if channel == "L":
+                signal = mid.astype(np.float64) + side[:len(mid)]
+            elif channel == "R":
+                signal = mid.astype(np.float64) - side[:len(mid)]
+            else:
+                signal = mid.astype(np.float64)
+            energies = np.array([np.mean(signal[p:p + size] ** 2) for p in positions])
+            active = energies > max(1e-7, float(energies.max()) * 1e-6)
+            curves = []
+            for pos in positions[active]:
+                curve = np.empty(hop)
+                # Bound scratch space: 128 phases, not a full-track transform.
+                for first in range(0, hop, 128):
+                    phases = np.arange(first, first + 128)
+                    block = signal[pos + phases[:, None] + np.arange(size)]
+                    coeff = np.abs(self._mdct_batch(block, window))[:, lo:hi]
+                    threshold = np.maximum(coeff.max(axis=1, keepdims=True) * 1e-5, 1e-8)
+                    curve[first:first + 128] = (coeff < threshold).mean(axis=1)
+                curves.append(curve)
+            if len(curves) < 4:
+                continue
+            # Long runs separated by short blocks need not share a 1024-sample
+            # phase. For 2048/256 windows, the short hop is 128; the two
+            # long/short transitions plus any short hops preserve phase modulo
+            # 128. Pool the eight equivalent long phases before voting. Apply
+            # the same pooling to off-grid baselines to account for this search.
+            curves = np.asarray(curves).reshape(len(curves), hop // 128, 128).max(axis=1)
+            baseline = np.median(curves, axis=1)
+            excess = curves - baseline[:, None]
+            # A genuine tone can have many zeros and a broad phase-dependent
+            # maximum. Demand both a large excess and a multiple of background.
+            votes = (excess >= 0.03) & (curves >= 3 * baseline[:, None] + 0.01)
+            support = votes.sum(axis=0)
+            strength = np.mean(np.maximum(excess, 0), axis=0)
+            valid = support >= max(4, math.ceil(len(curves) / 2))
+            score = float(np.max(np.where(valid, strength, 0.0)))
+            phase = int(np.argmax(np.where(valid, strength, 0.0)))
+            if score > best[0]:
+                best = (score, int(support[phase]) if score else 0, len(curves), channel)
+        return best
+
     def _mdct_quant_error(self, mid: "np.ndarray", side: "np.ndarray | None") -> float:
         """Derrien's blind genuine-lossless test. A lossy AAC encoder rounds scaled
         MDCT coefficients to integers; re-applying the same MDCT + scaling + rounding
@@ -1540,7 +1615,8 @@ class SpectralEngine:
         This is the backstop for high-bitrate AAC transcodes that keep full bandwidth
         and so leave no lowpass wall for the cutoff/void/fingerprint rules to catch.
         Only meaningful at 44.1/48 kHz (the swb table is rate-specific). Returns -1
-        when not applicable (wrong rate, too short)."""
+        when not applicable (wrong rate, too short, insufficient active anchors).
+        Quiet or unpopulated bands cannot vote: rounding zeros is not evidence."""
         sr = self.sample_rate
         if sr not in (44100, 48000):
             return -1.0
@@ -1568,40 +1644,42 @@ class SpectralEngine:
         n_anchors, n_sf, phase_step = 16, 8, 8
         phases = np.arange(0, N, phase_step)
 
-        # Pick high-energy, well-separated anchor positions from the mid channel
-        hop = N
-        npos = (len(mid) - N2) // hop
-        if npos < 2:
-            return -1.0
-        csq = np.concatenate(([0.0], np.cumsum(mid * mid)))   # window energies via prefix sums
-        starts = np.arange(npos) * hop
-        eblk = csq[starts + N2] - csq[starts]
-        # Digital silence rounds every coefficient to zero -> every band flags -> a
-        # spurious L=1. Require the loudest anchor to carry real signal (RMS > -70 dBFS
-        # at 16-bit scale; 32768*10^(-70/20) ~= 10 -> mean-square ~= N2*100).
-        if float(eblk.max()) < N2 * 100.0:
-            return -1.0
-        anchors = []
-        for idx in np.argsort(eblk)[::-1]:
-            pos = int(idx) * hop
-            base = pos - N // 2
-            if base < 0 or base + (N - 1) + N2 > len(mid):
-                continue
-            if all(abs(pos - p) > N2 for p in anchors):
-                anchors.append(pos)
-            if len(anchors) >= n_anchors:
-                break
-        if not anchors:
-            return -1.0
-
-        bestL = 0.0
+        bestL = -1.0
         for _name, sig in channels:
+            # Each channel needs its own active anchors. A silent side channel
+            # (dual mono) has exact zeros, which are not quantizer evidence.
+            hop = N
+            npos = (len(sig) - N2) // hop
+            if npos < 2:
+                continue
+            csq = np.concatenate(([0.0], np.cumsum(sig * sig)))
+            starts = np.arange(npos) * hop
+            eblk = csq[starts + N2] - csq[starts]
+            energy_floor = max(N2 * 100.0, float(eblk.max()) * 1e-6)
+            anchors = []
+            for idx in np.argsort(eblk)[::-1]:
+                if eblk[idx] < energy_floor:
+                    break
+                pos = int(idx) * hop
+                base = pos - N // 2
+                if base < 0 or base + (N - 1) + N2 > len(sig):
+                    continue
+                if all(abs(pos - p) > N2 for p in anchors):
+                    anchors.append(pos)
+                if len(anchors) >= n_anchors:
+                    break
+            # A single transient is insufficient evidence of a persistent grid.
+            if len(anchors) < 4:
+                continue
             windows = np.empty((len(anchors) * len(phases), N2), dtype=np.float64)
             for ai, a in enumerate(anchors):
                 base = a - N // 2
                 for pi, phi in enumerate(phases):
                     windows[ai * len(phases) + pi] = sig[base + phi : base + phi + N2]
             X = np.abs(self._mdct_batch(windows, win))
+            band_power = np.add.reduceat(X * X, seg_starts, axis=1) / K
+            energetic = band_power > np.maximum(
+                1.0, band_power.max(axis=1, keepdims=True) * 1e-6)
             maxX = np.maximum(np.maximum.reduceat(X, seg_starts, axis=1), 1e-12)
             sdz = 16.0 + (4.0 / 3.0) * np.log2(maxX)          # dead-zone scalefactor (Eq. 2)
             smin, smax = 0.3 * sdz, 0.7 * sdz                  # 90% of real AAC scalefactors
@@ -1614,14 +1692,21 @@ class SpectralEngine:
                 xsc = Xp * scale_bins
                 eps = np.round(xsc) - xsc
                 E = np.add.reduceat(eps * eps, seg_starts, axis=1)
-                c = (E < gam[None, :]).mean(axis=1)
+                # Near-zero coefficients round to zero in any signal, including
+                # pure tones and quiet bands. Only populated, energetic bands
+                # can support the quantization-error hypothesis.
+                populated = np.add.reduceat((xsc >= 0.5).astype(int), seg_starts, axis=1) >= K * 0.5
+                eligible = energetic & populated
+                supported = eligible.sum(axis=1) >= 16
+                c = ((E < gam[None, :]) & eligible).mean(axis=1)
+                c = np.where(supported, c, 0.0)
                 c_sf_phase[i_sf] = c.reshape(len(anchors), len(phases)).mean(axis=0)
             bestL = max(bestL, float(c_sf_phase.max()))
         return bestL
 
     @staticmethod
     def _interp_mdct(score: float) -> str:
-        if score < 0: return "n/a (only 44.1/48 kHz)"
+        if score < 0: return "n/a (requires 44.1/48 kHz and sufficient active audio)"
         if score < 0.06: return "✓ no MDCT quantization lattice — clean coefficient statistics"
         if score < 0.10: return "~ faint coefficient clustering"
         return "⚠ MDCT quantization lattice — AAC transcode signature"
@@ -1933,7 +2018,9 @@ class SpectralEngine:
         elif main_score >= 55: return "SUSPICIOUS", "⚠  Strong lossy indicators — probable transcode", caveats
         elif main_score >= 31: return "CAUTION", "~  Minor spectral quirks — possibly legitimate", caveats
         elif main_score >= 11: return "LIKELY_GENUINE", "✓  Consistent with genuine lossless source", caveats
-        else: return "GENUINE", "✓  Strong evidence of authentic lossless source", caveats
+        else:
+            caveats.append("No detected artifacts does not prove lossless ancestry; transparent lossy encodes can evade these tests.")
+            return "GENUINE", "✓  No strong lossy indicators detected — source history unverified", caveats
 
     def analyse(self, max_seconds: Optional[float] = None, status=None) -> SpectralAnalysis:
         st = status if status is not None else (lambda _msg: None)
@@ -1968,7 +2055,9 @@ class SpectralEngine:
         if int(active.sum()) >= 4:
             frames, phase_act = frames_all[active], phase_hi[active]
         else:
-            frames, phase_act = frames_all, phase_hi
+            result.primary_verdict = "Insufficient active audio for spectral analysis"
+            result.verdict_label = "INCONCLUSIVE"
+            return result
 
         st("spectral metrics")
         cutoffs_per_frame = self._cutoff_per_frame(frames, bins)
@@ -2207,10 +2296,9 @@ class SpectralEngine:
 
             # Rule: MDCT quantization-error lattice (Derrien JAES 2019) — the backstop
             # for high-bitrate AAC transcodes that keep full bandwidth and so leave no
-            # lowpass wall for any cutoff/void/fingerprint rule to catch. Blind, no
-            # reference, near-zero false-positive (genuine masters read < 0.04; AAC 256
-            # ~0.18, AAC 320 ~0.13). Skip analog/DSD sources — only AAC's exact MDCT
-            # grid produces the lattice, and the swb table is 44.1/48 kHz only.
+            # lowpass wall for any cutoff/void/fingerprint rule to catch. This is
+            # heuristic evidence, with activity/population gates to reject trivial
+            # zero rounding. Skip analog/DSD sources; the swb table is 44.1/48 kHz only.
             if (not self.native_dsd and not vinyl_detected and not cassette_detected
                     and self.sample_rate in (44100, 48000)):
                 st("mdct quantization")
@@ -2218,10 +2306,27 @@ class SpectralEngine:
                 result.mdct_quant_score = mdct_L
                 if mdct_L >= 0.10:
                     main += 55
-                    lossy_ev.append(f"MDCT Quantization Lattice: scaled MDCT coefficients re-round to integers across {mdct_L * 100:.0f}% of scalefactor bands (genuine lossless < 4%) — the fingerprint of an AAC encoder's quantizer surviving in 'lossless' PCM, with no lowpass wall to betray it.")
+                    lossy_ev.append(f"MDCT Quantization Lattice: scaled MDCT coefficients re-round to integers across {mdct_L * 100:.0f}% of scalefactor bands — consistent with an AAC quantizer fingerprint in decoded PCM; heuristic evidence, not proof of codec history.")
                 elif mdct_L >= 0.06:
                     main += 15
                     lossy_ev.append(f"Faint MDCT Coefficient Clustering: a weak integer-rounding lattice in the MDCT domain (strength {mdct_L:.3f}) — possible high-bitrate transcode.")
+
+        if _SCIPY_OK and not self.native_dsd:
+            st("Vorbis transform grid")
+            vg, support, tested, channel = self._vorbis_grid(audio, side)
+            result.vorbis_grid_score = vg
+            result.vorbis_grid_support, result.vorbis_grid_tested = support, tested
+            result.vorbis_grid_channel = channel
+            if vg >= 0.03:
+                # Correlated with spectral sparsity: establish a suspicion floor
+                # rather than adding another penalty for the same erased bins.
+                main = max(main, 55)
+                result.vorbis_grid_interp = "Vorbis-compatible transform-grid zeros"
+                lossy_ev.append(f"Vorbis Transform Grid: {vg * 100:.1f}% excess near-zero MDCT coefficients on Vorbis long-block alignments sharing a 128-sample short-hop grid ({support}/{tested} active clips, channel {channel}). Off-grid transforms lose the pattern — consistent with transform-codec quantization; not proof of a particular encoder.")
+            elif vg >= 0:
+                result.vorbis_grid_interp = "no persistent grid detected; Vorbis ancestry not excluded"
+            else:
+                result.vorbis_grid_interp = "n/a (requires active 44.1/48 kHz audio)"
 
         main = max(0, min(100, main))
         label, sentence, caveats = self._verdict(main, net_score, cutoff_hz, dsd_detected, cassette_detected, vinyl_detected,
@@ -2606,7 +2711,7 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     sp = auth.spectral
     if sp and sp.verdict_label != "INCONCLUSIVE":
         print(f"  {_c(C.GREY, f'Main score {sp.main_score}/100  ·  base engine: lossy {sp.lossy_score} − natural {sp.natural_score} = net {sp.net_score}/{sp.max_score}  ·  raw error {sp.raw_lossy_pct:.1f}%')}")
-        print(f"  {_c(C.DIM + C.GREY, '0 = pristine lossless   ·   100 = certain transcode')}")
+        print(f"  {_c(C.DIM + C.GREY, '0 = no scored indicators   ·   100 = strongest heuristic evidence')}")
         print()
         rows_spec = [
             _mrow("Ultrasonic Noise", "DSD/SACD transcode profile", "", "warn") if sp.dsd_detected else _mrow("Ultrasonic Noise", "Normal", "", "ok"),
@@ -2652,6 +2757,7 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
                 _mrow("auCDtect Bound", f"{sp.auc_avg_bound_freq:,.0f} Hz avg · {sp.auc_prob_bound_freq:,.0f} Hz mode", sp.auc_bound_interp, _stat(_bound_colour(sp.auc_avg_bound_freq))),
                 _mrow("HF Phase Entropy", f"{sp.auc_phase_entropy:.2f} bits", sp.auc_phase_interp, _stat(_phase_ent_colour(sp.auc_phase_entropy))),
                 mdct,
+                _mrow("Vorbis Transform Grid", "n/a" if sp.vorbis_grid_score < 0 else f"{sp.vorbis_grid_score:.3f} ({sp.vorbis_grid_support}/{sp.vorbis_grid_tested} clips)", sp.vorbis_grid_interp, "warn" if sp.vorbis_grid_score >= 0.03 else "data"),
                 _mrow("Spectral Sparsity", f"{sp.spectral_sparsity:.3f}", sp.sparsity_interp, _stat(_sparsity_colour(sp.spectral_sparsity))),
                 _mrow("Ultrasonic Corr.", f"{sp.hf_envelope_correlation:+.2f}", sp.hf_env_corr_interp, _stat(_ultra_corr_colour(sp.hf_envelope_correlation))),
                 _mrow("Pre-Echo", f"{sp.preecho_pct:.1f}% of transients", "[MDCT block smearing]", _stat(_preecho_colour(sp.preecho_pct))),

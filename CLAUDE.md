@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## September 2026 accuracy update
+
+Read `ACCURACY_NOTES.md` for the current detector behavior and validation. It
+supersedes historical accuracy claims and timings below. In particular:
+
+- AAC lattice votes require active per-channel anchors and populated bands;
+  silent side channels and tones are not codec evidence.
+- `_vorbis_grid` reconstructs L/R and searches common 2048/256 Vorbis blocks,
+  pooling long-block phases modulo the 128-sample short hop before voting.
+  Persistent evidence establishes a score floor of 55; it is not a probability.
+- No-artifact results do not prove lossless ancestry. Never claim zero false
+  positives by construction or infer real-music accuracy from noise fixtures.
+- Run `python -X utf8 test_dsp.py` and
+  `python -X utf8 -m unittest -v test_accuracy test_vorbis` for current regressions.
+  The older gitignored real-music harness described below is not in this checkout.
+- `culprit-analysis.json` and `masha-analysis.json` are local diagnostic outputs,
+  not portable test fixtures. The supplied tracks have no paired original encodes.
+
 ## Project Overview
 
 **Audio Forensic** is a command-line tool for comprehensive audio authenticity analysis. Unlike generic audio tools that falsely flag normal mastered audio, this tool uses calibrated thresholds specifically tuned for real-world commercially mastered audio.
@@ -113,7 +131,7 @@ Core authenticity verdict engine. One stereo decode feeds everything (mid `(L+R)
 - `_cassette_source()` — Rule 11 veto: tape hiss + natural slope + wow/flutter; score ≥30 subtracts 40 and disarms the segment vote
 - `_spectral_sparsity()` — psychoacoustically zeroed bins (<-95 dB rel) *below* the cutoff
 - `_ultrasonic_envelope_correlation()` — Pearson corr of mid-band vs high-band envelopes; exposes anti-forensic fake HF noise injection when combined with a collapsed auCDtect bound
-- `_mdct_quant_error()` — **the high-bitrate AAC backstop** (Derrien, JAES 2019). The ONLY detector that sees a full-bandwidth transcode with no lowpass wall — it closed the documented AAC ≥256 miss. A lossy AAC encoder rounds scaled MDCT coefficients to integers; **rounding is idempotent**, so re-applying the *same* MDCT + AAC ^0.75 scaling + round to already-transcoded PCM yields near-zero error, whereas genuine lossless yields the usual U[−½,½] quantization noise. Per AAC scalefactor band (`_SWB_LONG_44_48`, the 49-band swb table shared by 44.1k/48k) it measures the rounding-error energy E and counts bands where E < γ(K), with **γ chosen so genuine P(E<γ)=0.01 per band** (truncated-normal quantile via `scipy.special.ndtr/ndtri`; E~K/12 mean, K/180 var by the CLT). The statistic `c` = fraction of flagged bands, averaged over high-energy anchor frames **at a shared block-grid phase** (a transcode makes many frames flag at the *same* global MDCT phase; genuine never aligns), and `L` = max c over channels (M+S), 8 scalefactor levels in the [0.3,0.7]·sdz dead-zone range, and phases. **MDCT = `_mdct_batch` (Princen-Bradley TDAC fold + orthonormal DCT-IV), 2048-sample KBD window (`_kbd_window`, α=4 — ffmpeg's AAC window).** Measured: genuine masters/vinyl/MQA **< 0.04**; AAC 256 → **0.18**, AAC 320 → **0.13**; native-AAC .m4a → 0.62. Thresholds: **L ≥ 0.10 → +55** (lands on SUSPICIOUS), **0.06 ≤ L < 0.10 → +15** (corroborating). Gated to 44.1/48 kHz only (swb table is rate-specific), skips DSD/vinyl/cassette, and **abstains (returns −1) on near-silence** (every coefficient rounds to zero → spurious L=1; guarded by a −70 dBFS loudest-anchor energy floor). ~1.2 s on a 5-min track (phase-stepped ×8 — detection is phase-robust, validated). **Blind, no reference, zero false positives by construction.** **Known blind spots (from the source paper): TNS and SBR (HE-AAC/AAC+) defeat it** — regenerated HF has no matching MDCT grid; and it assumes the AAC analysis window. Vorbis/Opus use different windows/grids and read low here (they're caught by the wall/fingerprint paths instead). Calibration harness: `testdata/derrien_dev.py` (gitignored)
+- `_mdct_quant_error()` — **the high-bitrate AAC backstop** (Derrien, JAES 2019). The ONLY detector that sees a full-bandwidth transcode with no lowpass wall — it closed the documented AAC ≥256 miss. A lossy AAC encoder rounds scaled MDCT coefficients to integers; **rounding is idempotent**, so re-applying the *same* MDCT + AAC ^0.75 scaling + round to already-transcoded PCM yields near-zero error, whereas genuine lossless yields the usual U[−½,½] quantization noise. Per AAC scalefactor band (`_SWB_LONG_44_48`, the 49-band swb table shared by 44.1k/48k) it measures the rounding-error energy E and counts bands where E < γ(K), with **γ chosen so genuine P(E<γ)=0.01 per band** (truncated-normal quantile via `scipy.special.ndtr/ndtri`; E~K/12 mean, K/180 var by the CLT). The statistic `c` = fraction of flagged bands, averaged over high-energy anchor frames **at a shared block-grid phase** (a transcode makes many frames flag at the *same* global MDCT phase; genuine never aligns), and `L` = max c over channels (M+S), 8 scalefactor levels in the [0.3,0.7]·sdz dead-zone range, and phases. **MDCT = `_mdct_batch` (Princen-Bradley TDAC fold + orthonormal DCT-IV), 2048-sample KBD window (`_kbd_window`, α=4 — ffmpeg's AAC window).** Measured: genuine masters/vinyl/MQA **< 0.04**; AAC 256 → **0.18**, AAC 320 → **0.13**; native-AAC .m4a → 0.62. Thresholds: **L ≥ 0.10 → +55** (lands on SUSPICIOUS), **0.06 ≤ L < 0.10 → +15** (corroborating). Gated to 44.1/48 kHz only (swb table is rate-specific), skips DSD/vinyl/cassette, and **abstains (returns −1) on near-silence** (every coefficient rounds to zero → spurious L=1; guarded by a −70 dBFS loudest-anchor energy floor). ~1.2 s on a 5-min track (phase-stepped ×8 — detection is phase-robust, validated). **Blind heuristic; false positives remain possible.** **Known blind spots (from the source paper): TNS and SBR (HE-AAC/AAC+) defeat it** — regenerated HF has no matching MDCT grid; and it assumes the AAC analysis window. Vorbis/Opus use different windows/grids and read low here (they're caught by the wall/fingerprint paths instead). Calibration harness: `testdata/derrien_dev.py` (gitignored)
 - `_fft_band_extract()` — zero-phase FFT brickwall band isolation. **Use this, not Butterworth, for noise-floor measurement**: IIR skirts (~24 dB/oct) leak loud music into a quiet band ~0.1 octave away
 - `analyse()` — orchestrates the 11-rule flow, combines into **Main Score (0–100)**
 
