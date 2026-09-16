@@ -5,5 +5,6 @@ testdata/*
 !testdata/make_fixtures.py
 !testdata/measure.py
 !testdata/measure_memory.py
+!testdata/compare_engines.py
 !testdata/profile.py
 research/
