@@ -221,6 +221,7 @@ class SpectralAnalysis:
     dsd_detected: bool = False; lossy_score: int = 0
     natural_score: int = 0; net_score: int = 0; max_score: int = 0
     raw_lossy_pct: float = 0.0; net_confidence_pct: float = 0.0
+    heuristic_score: int = 0; known_lossy_codec: str = ""
     verdict_label: str = ""; primary_verdict: str = ""
     evidence: list[str] = field(default_factory=list)
     natural_evidence: list[str] = field(default_factory=list)
@@ -263,6 +264,14 @@ class AuthenticityReport:
     cassette_rip_detected: bool = False
     vinyl_rip_detected: bool = False
     mqa_detected: bool = False
+    mqa_metadata_claimed: bool = False
+    mqa_studio: Optional[bool] = None
+    mqa_original_sample_rate: int = 0
+    mqa_bit_plane: int = -1
+    mqa_sync_sample: int = -1
+    mqa_evidence: str = ""
+    mqa_scan_status: str = "not_scanned"
+    mqa_scan_error: str = ""
     side_channel_analysis: str = ""
     header_integrity: str = ""
     encoder_trace: str = ""
@@ -367,41 +376,161 @@ def detect_encoder_trace(tags: AudioTags, tech: AudioTechnical, filepath: Path) 
     if not hits: return ""
     return f"⚠ Lossy encoder fingerprint in metadata: {', '.join(hits)} — tags survived a transcode"
 
-_MQA_MAGIC = 0xbe0498c88  # 36-bit MQA sync word (reverse-engineered, MQA_identifier project)
+_MQA_MAGIC = 0xbe0498c88
+_MQA_MAGIC_BITS = 36
+_MQA_MAGIC_MASK = (1 << _MQA_MAGIC_BITS) - 1
+_MQA_SCAN_SECONDS = 3
+
+@dataclass(frozen=True)
+class MQADetection:
+    """Bit-exact MQA signalling result.
+
+    A metadata claim is deliberately not promoted to ``detected``: tags are freely
+    editable, while the sync word is carried by the decoded PCM samples.
+    """
+    detected: bool = False
+    metadata_claimed: bool = False
+    studio: Optional[bool] = None
+    original_sample_rate: int = 0
+    bit_plane: int = -1
+    sync_sample: int = -1
+    error: str = ""
+
+def _mqa_original_sample_rate(code: int) -> int:
+    """Decode the reverse-engineered four-bit MQA original-rate field."""
+    code &= 0x0f
+    base = 48000 if code & 1 else 44100
+    exponent = ((code >> 3) & 1) | (((code >> 2) & 1) << 1) | (((code >> 1) & 1) << 2)
+    multiplier = 1 << exponent
+    # Codes above 16x describe DSD-family rates in the reference implementation.
+    if multiplier > 16:
+        multiplier *= 2
+    return base * multiplier
+
+def _scan_mqa_pcm(samples: "np.ndarray", bit_depth: int,
+                  *, metadata_claimed: bool = False) -> MQADetection:
+    """Search right-aligned integer stereo PCM for MQA signalling.
+
+    The marker is serialized MSB-first in one of three planes beginning at the
+    16th-most-significant source bit (planes 0..2 for 16-bit, 8..10 for 24-bit).
+    """
+    if not _NUMPY_OK or bit_depth not in (16, 24):
+        return MQADetection(metadata_claimed=metadata_claimed, error="unsupported PCM depth")
+    if samples.ndim != 2 or samples.shape[1] != 2:
+        return MQADetection(metadata_claimed=metadata_claimed, error="MQA signalling requires stereo PCM")
+    if len(samples) < _MQA_MAGIC_BITS:
+        return MQADetection(metadata_claimed=metadata_claimed)
+
+    native = np.asarray(samples, dtype=np.int32)
+    xor = np.bitwise_xor(native[:, 0], native[:, 1]).view(np.uint32)
+    positions = (bit_depth - 16, bit_depth - 15, bit_depth - 14)
+    windows = [0, 0, 0]
+
+    def payload(start: int, count: int, plane: int) -> Optional[int]:
+        if start < 0 or start + count > len(xor):
+            return None
+        value = 0
+        for word in xor[start:start + count]:
+            value = (value << 1) | ((int(word) >> plane) & 1)
+        return value
+
+    for sample_index, word in enumerate(xor):
+        value = int(word)
+        for slot, plane in enumerate(positions):
+            windows[slot] = ((windows[slot] << 1) | ((value >> plane) & 1)) & _MQA_MAGIC_MASK
+            if windows[slot] != _MQA_MAGIC:
+                continue
+
+            rate_code = payload(sample_index + 3, 4, plane)
+            provenance = payload(sample_index + 29, 5, plane)
+            return MQADetection(
+                detected=True,
+                metadata_claimed=metadata_claimed,
+                studio=(provenance > 8) if provenance is not None else None,
+                original_sample_rate=_mqa_original_sample_rate(rate_code) if rate_code is not None else 0,
+                bit_plane=plane,
+                sync_sample=sample_index,
+            )
+    return MQADetection(metadata_claimed=metadata_claimed)
+
+def inspect_mqa(tags: AudioTags, tech: AudioTechnical, filepath: Path) -> MQADetection:
+    """Decode the first three seconds and inspect the actual PCM control stream."""
+    metadata_text = " ".join([tech.writing_library, tech.format_profile,
+                              *tags.other.keys(), *tags.other.values()])
+    metadata_claimed = bool(re.search(
+        r"(?i)(?:^|[^a-z0-9])mqa(?:\s*encode(?:r)?|\s*studio)?(?:[^a-z0-9]|$)",
+        metadata_text,
+    ))
+
+    match = re.search(r"(\d+)\s*-?bit", tech.precision, re.IGNORECASE)
+    bit_depth = int(match.group(1)) if match else 0
+    channel_match = re.search(r"\d+", str(tech.channels))
+    channels = int(channel_match.group()) if channel_match else 0
+    if not _NUMPY_OK:
+        return MQADetection(metadata_claimed=metadata_claimed, error="numpy unavailable")
+    if bit_depth not in (16, 24) or channels != 2:
+        return MQADetection(metadata_claimed=metadata_claimed, error="unsupported stream layout")
+
+    # FFmpeg expands integer PCM into the high bits of s32le. Shifting it back
+    # produces the exact right-aligned source words expected by the parser.
+    try:
+        decoded = subprocess.run([
+            "ffmpeg", "-v", "error", "-i", str(filepath), "-vn",
+            "-t", str(_MQA_SCAN_SECONDS), "-ac", "2", "-c:a", "pcm_s32le",
+            "-f", "s32le", "pipe:1",
+        ], capture_output=True, check=False)
+    except (FileNotFoundError, OSError) as exc:
+        return MQADetection(metadata_claimed=metadata_claimed, error=str(exc))
+    usable = len(decoded.stdout) // 8 * 8
+    if decoded.returncode != 0 or usable < _MQA_MAGIC_BITS * 8:
+        message = decoded.stderr.decode("utf-8", errors="replace").strip()
+        return MQADetection(metadata_claimed=metadata_claimed,
+                            error=message or "PCM decode failed")
+    samples = np.frombuffer(decoded.stdout[:usable], dtype="<i4").reshape(-1, 2)
+    samples = np.right_shift(samples, np.int32(32 - bit_depth))
+    return _scan_mqa_pcm(samples, bit_depth, metadata_claimed=metadata_claimed)
+
+def _mqa_note(result: MQADetection) -> str:
+    if not result.detected:
+        if result.error:
+            prefix = "MQA metadata claim present; " if result.metadata_claimed else ""
+            detail = result.error.replace("\n", " ")[:180]
+            return f"{prefix}embedded MQA scan was inconclusive ({detail})."
+        if result.metadata_claimed:
+            return ("MQA metadata claim present, but no embedded 36-bit sync word was found "
+                    f"in the first {_MQA_SCAN_SECONDS} seconds; the tag alone is not proof.")
+        return ""
+    kind = "MQA Studio" if result.studio else "MQA"
+    rate = f", original rate {result.original_sample_rate / 1000:g} kHz" if result.original_sample_rate else ""
+    return (f"{kind} signalling detected via embedded 36-bit sync word "
+            f"(source bit {result.bit_plane}{rate}). Spectral forensics see only the PCM core; "
+            "the folded payload and lossy unfold cannot be independently verified.")
+
+def _apply_mqa_override(spectral: SpectralAnalysis, result: MQADetection) -> None:
+    """A structural MQA hit is categorical lossy-codec evidence.
+
+    Keep the pre-override heuristic score for diagnostics, but never allow clean
+    spectra or natural-evidence credits to turn confirmed MQA green.
+    """
+    if not result.detected:
+        return
+    kind = "MQA Studio" if result.studio else "MQA"
+    rate = (f", original rate {result.original_sample_rate / 1000:g} kHz"
+            if result.original_sample_rate else "")
+    spectral.known_lossy_codec = kind
+    spectral.main_score = 100
+    spectral.net_confidence_pct = 100.0
+    spectral.verdict_label = "KNOWN_LOSSY"
+    spectral.primary_verdict = f"✗  {kind} structurally confirmed — known lossy encoding in FLAC"
+    evidence = (f"Known Lossy Encoding: embedded {kind} control stream confirmed by repeated-format "
+                f"36-bit sync signalling at source bit {result.bit_plane}{rate}. FLAC preserves the "
+                "encoded PCM exactly; it does not make the master-to-MQA transformation lossless.")
+    if evidence not in spectral.evidence:
+        spectral.evidence.insert(0, evidence)
 
 def detect_mqa(tags: AudioTags, tech: AudioTechnical, filepath: Path) -> str:
-    """MQA folds 'hi-res' data into the LSBs as pseudo-noise dither — spectrally
-    invisible to PCM forensics (the stream verifies as ordinary 16/44.1 lossless).
-    Two layers: metadata traces (fast), then the signal itself — MQA carries a
-    control stream in (L XOR R) at bit position (depth−16) that begins with a
-    36-bit sync word. Tag-stripping can't remove that."""
-    hay = " ".join([tech.writing_library, tech.format_profile, tags.comments,
-                    *tags.other.keys(), *tags.other.values()]).lower()
-    found = "metadata tags" if "mqa" in hay else ""
-
-    depth = 0
-    try: depth = int(tech.precision.replace("-bit", "").strip())
-    except ValueError: pass
-    if not found and _NUMPY_OK and depth in (16, 24) and tech.channels.strip() == "2":
-        # First 4 s, bit-exact stereo decode (s32le: sample sits in the top bits)
-        r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(filepath), "-vn", "-t", "4",
-                            "-ac", "2", "-c:a", "pcm_s32le", "-f", "s32le", "pipe:1"],
-                           capture_output=True, check=False)
-        if r.returncode == 0 and len(r.stdout) >= 8 * 4096:
-            arr = np.frombuffer(r.stdout[: len(r.stdout) // 8 * 8], dtype=np.int32).reshape(-1, 2)
-            x = np.bitwise_xor(arr[:, 0], arr[:, 1]).view(np.uint32) >> np.uint32(32 - depth)
-            weights = 2.0 ** np.arange(35, -1, -1)  # rolling 36-bit window, MSB first
-            for pos in (depth - 16, depth - 15, depth - 14):
-                bits = ((x >> np.uint32(pos)) & 1).astype(np.float64)
-                if len(bits) < 36: break
-                vals = np.lib.stride_tricks.sliding_window_view(bits, 36) @ weights
-                if np.any(vals == float(_MQA_MAGIC)):
-                    found = f"sync word in the bitstream (bit {pos})"
-                    break
-    if not found: return ""
-    return (f"MQA-encoded stream (detected via {found}) — high-frequency content is "
-            "origami-folded into the low-order bits as pseudo-noise. Spectral forensics see "
-            "only the PCM core; the folded payload (and its lossy unfold) cannot be verified.")
+    """Backward-compatible display-note wrapper around :func:`inspect_mqa`."""
+    return _mqa_note(inspect_mqa(tags, tech, filepath))
 
 _SOX_UNSUPPORTED = {".m4a", ".mp4", ".aac", ".ogg", ".opus", ".wma", ".ape", ".mp3", ".dff", ".dsf"}
 
@@ -2347,6 +2476,7 @@ class SpectralEngine:
         result.lossy_score, result.natural_score, result.net_score, result.max_score = lossy_score, natural_score, net_score, self.MAX_LOSSY_SCORE
         result.raw_lossy_pct = min(100.0, lossy_score / self.MAX_LOSSY_SCORE * 100.0) if lossy_score > 0 else 0.0
         result.main_score = main
+        result.heuristic_score = main
         result.net_confidence_pct = float(main)
         result.sparsity_interp = self._interp_sparsity(result.spectral_sparsity, legit_cutoff)
         result.hf_env_corr_interp = self._interp_ultra_corr(result.hf_envelope_correlation)
@@ -2425,9 +2555,22 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
     if native_dsd:
         auth.bit_depth_authentic = "DSD 1-bit stream — PCM trailing-zero analysis not applicable"
     auth.encoder_trace = detect_encoder_trace(tags, tech, filepath)
-    if mqa_note := detect_mqa(tags, tech, filepath):
-        spectral.caveats.append(mqa_note)
-        auth.mqa_detected = True
+    mqa = inspect_mqa(tags, tech, filepath)
+    if mqa.detected:
+        _apply_mqa_override(spectral, mqa)
+        auth.spectral_cutoff_verdict = spectral.primary_verdict
+    elif note := _mqa_note(mqa):
+        spectral.caveats.append(note)
+    auth.mqa_detected = mqa.detected
+    auth.mqa_metadata_claimed = mqa.metadata_claimed
+    auth.mqa_studio = mqa.studio
+    auth.mqa_original_sample_rate = mqa.original_sample_rate
+    auth.mqa_bit_plane = mqa.bit_plane
+    auth.mqa_sync_sample = mqa.sync_sample
+    auth.mqa_evidence = "embedded_sync" if mqa.detected else ("metadata_only" if mqa.metadata_claimed else "")
+    auth.mqa_scan_status = ("detected" if mqa.detected else "inconclusive" if mqa.error
+                            else "metadata_only" if mqa.metadata_claimed else "not_detected")
+    auth.mqa_scan_error = mqa.error
     # Byproducts of the engine's decode — no extra ffmpeg processes
     auth.phase_correlation, auth.phase_verdict = measure_phase_correlation(engine.audio_mid, engine.audio_side, sample_rate)
     auth.clipped_samples, auth.clipping_verdict = detect_clipping(engine.audio_mid, engine.audio_side)
@@ -2625,8 +2768,10 @@ def _sox_amplitude_colour(key: str, raw: str) -> str:
     except ValueError: return C.WHITE
     return C.WHITE
 
-_VERDICT_GLYPH = {"GENUINE": "✓", "LIKELY_GENUINE": "✓", "CAUTION": "~", "SUSPICIOUS": "⚠", "LIKELY_LOSSY": "✗"}
-_VERDICT_COL = {"GENUINE": C.GREEN, "LIKELY_GENUINE": C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE, "LIKELY_LOSSY": C.RED}
+_VERDICT_GLYPH = {"GENUINE": "✓", "LIKELY_GENUINE": "✓", "CAUTION": "~", "SUSPICIOUS": "⚠",
+                  "LIKELY_LOSSY": "✗", "KNOWN_LOSSY": "✗"}
+_VERDICT_COL = {"GENUINE": C.GREEN, "LIKELY_GENUINE": C.GREEN, "CAUTION": C.YELLOW, "SUSPICIOUS": C.ORANGE,
+                "LIKELY_LOSSY": C.RED, "KNOWN_LOSSY": C.RED}
 
 def _print_banner(report: ForensicReport, sz: Optional[float]) -> None:
     """Executive summary at the very top — verdict, headline finding, and the key
@@ -2660,8 +2805,13 @@ def _print_banner(report: ForensicReport, sz: Optional[float]) -> None:
         print(f"  {_c(C.GREY, 'LOUDNESS'.ljust(9))}{_c(C.GREY, '  ·  ').join(loud)}")
     if sp and sp.verdict_label not in ("", "INCONCLUSIVE"):
         nl, nn = len(sp.evidence), len(sp.natural_evidence)
-        genuine = sp.verdict_label in ("GENUINE", "LIKELY_GENUINE")
-        sig = _c(C.GREY if (genuine or not nl) else C.ORANGE, f"⚠ {nl} lossy") + _c(C.GREY, "  ·  ") + _c(C.GREEN if nn else C.GREY, f"✓ {nn} natural")
+        if sp.known_lossy_codec:
+            sig = (_c(C.RED, f"✗ {sp.known_lossy_codec} confirmed") + _c(C.GREY, "  ·  ")
+                   + _c(C.GREY, f"spectral heuristic {sp.heuristic_score}/100"))
+        else:
+            genuine = sp.verdict_label in ("GENUINE", "LIKELY_GENUINE")
+            sig = (_c(C.GREY if (genuine or not nl) else C.ORANGE, f"⚠ {nl} lossy")
+                   + _c(C.GREY, "  ·  ") + _c(C.GREEN if nn else C.GREY, f"✓ {nn} natural"))
         print(f"  {_c(C.GREY, 'SIGNALS'.ljust(9))}{sig}")
 
 def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None) -> None:
@@ -2710,7 +2860,14 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     print(_subsection("Spectral Analysis  (numpy FFT engine)"))
     sp = auth.spectral
     if sp and sp.verdict_label != "INCONCLUSIVE":
-        print(f"  {_c(C.GREY, f'Main score {sp.main_score}/100  ·  base engine: lossy {sp.lossy_score} − natural {sp.natural_score} = net {sp.net_score}/{sp.max_score}  ·  raw error {sp.raw_lossy_pct:.1f}%')}")
+        if sp.known_lossy_codec:
+            detail = (f"Main score 100/100  ·  categorical override: {sp.known_lossy_codec}  ·  "
+                      f"spectral heuristic {sp.heuristic_score}/100  ·  base spectral evidence {sp.raw_lossy_pct:.1f}%")
+        else:
+            detail = (f"Main score {sp.main_score}/100  ·  base engine: lossy {sp.lossy_score} − "
+                      f"natural {sp.natural_score} = net {sp.net_score}/{sp.max_score}  ·  "
+                      f"base spectral evidence {sp.raw_lossy_pct:.1f}%")
+        print(f"  {_c(C.GREY, detail)}")
         print(f"  {_c(C.DIM + C.GREY, '0 = no scored indicators   ·   100 = strongest heuristic evidence')}")
         print()
         rows_spec = [
@@ -2777,7 +2934,7 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
         # Once the verdict is decided (SUSPICIOUS+), the green "Natural indicators"
         # read as if they argue against it and the always-on context notes are noise —
         # suppress both, keeping only file-specific caveats under a "Caveats" header.
-        decided = sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY")
+        decided = sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY", "KNOWN_LOSSY")
         if sp.evidence:
             print(f"\n  {_c(C.DIM + C.ORANGE, 'Lossy indicators')}")
             for e in sp.evidence: print(f"    {_c(C.GREY, '·')} {_c(C.WHITE, e)}")
@@ -2805,13 +2962,13 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     # decided lossy verdict) so a green never appears on a file the engine already
     # called fake, independent of the bit-depth prongs' own thresholds.
     bits_regenerated = bool(sp and bd_text.startswith("✓") and (
-        sp.resample_detected or sp.fake_hires or sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY")))
+        sp.resample_detected or sp.fake_hires or sp.verdict_label in ("SUSPICIOUS", "LIKELY_LOSSY", "KNOWN_LOSSY")))
     if bits_regenerated:
         m = re.search(r"(\d+)-bit", bd_text)
         depth = f"{m.group(1)}-bit" if m else "Claimed depth"
-        bd_text = f"~ {depth} container full, but source depth unverifiable on a transcoded/upsampled stream"
+        bd_text = f"~ {depth} container full, but source depth unverifiable after lossy encoding/transcoding"
     if bits_regenerated:
-        bd_status, bd_interp = "warn", "interpolation/requantization regenerates the low-order bits"
+        bd_status, bd_interp = "warn", "lossy encoding or requantization can regenerate the low-order bits"
     elif bd_text.startswith("⚠"): bd_status, bd_interp = "bad", ""
     elif bd_text.startswith("✓"): bd_status, bd_interp = "ok", ""
     else: bd_status, bd_interp = "data", ""
@@ -2819,7 +2976,21 @@ def print_report(report: ForensicReport, *, file_size_mb: Optional[float] = None
     hi = auth.header_integrity
     if hi: si_rows.append(_mrow("Header Integrity", _degl(hi), "", "ok" if hi.startswith("✓") else "data"))
     if auth.encoder_trace: si_rows.append(_mrow("Encoder Trace", auth.encoder_trace, "", "bad"))
-    if auth.mqa_detected: si_rows.append(_mrow("MQA", "MQA-encoded — folded payload not verifiable by PCM analysis", "", "warn"))
+    if auth.mqa_detected:
+        mqa_kind = "MQA Studio" if auth.mqa_studio else "MQA"
+        mqa_rate = (f" · original {auth.mqa_original_sample_rate / 1000:g} kHz"
+                    if auth.mqa_original_sample_rate else "")
+        si_rows.append(_mrow("MQA", f"{mqa_kind} · embedded sync{mqa_rate} · source bit {auth.mqa_bit_plane}",
+                             "folded payload not independently verifiable", "warn"))
+    elif auth.mqa_metadata_claimed:
+        if auth.mqa_scan_error:
+            si_rows.append(_mrow("MQA", "metadata claim only — structural scan inconclusive",
+                                 auth.mqa_scan_error[:100], "caut"))
+        else:
+            si_rows.append(_mrow("MQA", "metadata claim only — embedded sync not found",
+                                 f"first {_MQA_SCAN_SECONDS} seconds scanned", "caut"))
+    elif auth.mqa_scan_status == "inconclusive" and "unsupported stream layout" not in auth.mqa_scan_error:
+        si_rows.append(_mrow("MQA", "structural scan inconclusive", auth.mqa_scan_error[:100], "caut"))
     if source_flags: si_rows.append(_mrow("Analog Source", " + ".join(source_flags) + " signature detected", "", "info"))
     if auth.side_channel_analysis: si_rows.append(_mrow("Side Channel", auth.side_channel_analysis, "", "data"))
     if auth.phase_correlation: si_rows.append(_mrow("Phase Corr.", f"{auth.phase_correlation} {auth.phase_verdict}", "", "data"))
