@@ -4,5 +4,6 @@ __pycache__/
 testdata/*
 !testdata/make_fixtures.py
 !testdata/measure.py
+!testdata/measure_memory.py
 !testdata/profile.py
 research/

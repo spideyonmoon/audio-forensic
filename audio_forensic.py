@@ -94,7 +94,34 @@ def _mrow(key: str, main: str, interp: str = "", status: str = "data", *, kw: in
     return f"  {gutter} {keytxt} {body}"
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    # Pinned to UTF-8 with replacement: the child tools emit non-ASCII tag text, and
+    # the Windows default code page (cp1252) raises UnicodeDecodeError on it.
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", check=False)
+
+def _pipe_ffmpeg_to_sox(filepath: Path, channels: int,
+                        sox_args: list[str]) -> tuple[subprocess.CompletedProcess, int]:
+    """Decode with ffmpeg and stream the WAV straight into SoX's stdin.
+
+    The previous shape captured the whole decoded WAV as a Python bytes object and
+    passed it as ``input=``, so a full-track buffer sat in RAM for as long as SoX
+    ran — concurrent with the DSP engine's own decode. Chaining the two pipes lets
+    the kernel move the bytes instead; nothing is buffered in this process.
+
+    Returns (sox result with stderr captured, ffmpeg returncode).
+    """
+    decode = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", str(filepath), "-vn",
+         "-ac", str(channels), "-sample_fmt", "s16", "-f", "wav", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        proc = subprocess.run(["sox", "-t", "wav", "-", *sox_args],
+                              stdin=decode.stdout, capture_output=True, check=False)
+    finally:
+        if decode.stdout is not None:
+            decode.stdout.close()   # drop our duplicate of the read end
+        decode.wait()
+    return proc, decode.returncode
 
 # ---------------------------------------------------------------------------
 # Live progress (single status line on stderr; thread-safe; TTY only)
@@ -540,15 +567,10 @@ _AUDIO_EXTS = {".flac", ".wav", ".alac", ".m4a", ".mp4", ".ape", ".wv", ".aiff",
 
 def extract_sox_stats(filepath: Path) -> dict[str, str]:
     if filepath.suffix.lower() in _SOX_UNSUPPORTED:
-        # SoX can't read these natively — pipe a WAV decode straight from ffmpeg
-        # into SoX's stdin (no temp file, stays in RAM).
-        decode = subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", str(filepath), "-vn",
-             "-ac", "2", "-sample_fmt", "s16", "-f", "wav", "pipe:1"],
-            capture_output=True, check=False)
-        if decode.returncode != 0 or not decode.stdout: return {}
-        result = subprocess.run(["sox", "-t", "wav", "-", "-n", "stat"],
-                                input=decode.stdout, capture_output=True, check=False)
+        # SoX can't read these natively — stream a WAV decode straight from ffmpeg
+        # into SoX's stdin (no temp file, no full-track buffer in this process).
+        result, decode_rc = _pipe_ffmpeg_to_sox(filepath, 2, ["-n", "stat"])
+        if decode_rc != 0 or result.returncode != 0: return {}
         stderr_text = result.stderr.decode("utf-8", errors="replace")
     else:
         stderr_text = _run(["sox", str(filepath), "-n", "stat"]).stderr
@@ -818,19 +840,30 @@ def _bit_depth_verdict(claimed_depth: int, effective_bits: int, prof: "dict | No
 #     silencedetect) — two of which were silently broken filter syntax anyway.
 
 def measure_phase_correlation(mid: "np.ndarray | None", side: "np.ndarray | None", sample_rate: int) -> tuple[str, str]:
-    """Mean per-100ms Pearson correlation between L and R (1 mono · 0 uncorrelated · -1 antiphase)."""
+    """Mean per-100ms Pearson correlation between L and R (1 mono · 0 uncorrelated · -1 antiphase).
+
+    Rows are processed in chunks: every block's mean/sum reduction is independent of
+    the others, so chunking along the row axis yields bit-identical results without
+    materializing six full-track float64 arrays (~6x the decoded PCM at peak)."""
     if not _NUMPY_OK or mid is None or side is None: return "", ""
-    left, right = mid + side, mid - side
     block = max(1, sample_rate // 10)
-    n = len(left) // block
+    n = len(mid) // block
     if n < 1: return "", ""
-    L = left[: n * block].reshape(n, block).astype(np.float64)
-    R = right[: n * block].reshape(n, block).astype(np.float64)
-    L -= L.mean(axis=1, keepdims=True); R -= R.mean(axis=1, keepdims=True)
-    denom = np.sqrt(np.sum(L * L, axis=1) * np.sum(R * R, axis=1))
+    nums, denoms = [], []
+    ROWS = 256
+    for start in range(0, n, ROWS):
+        cnt = min(ROWS, n - start)
+        sl = slice(start * block, (start + cnt) * block)
+        L = (mid[sl] + side[sl]).reshape(cnt, block).astype(np.float64)
+        R = (mid[sl] - side[sl]).reshape(cnt, block).astype(np.float64)
+        L -= L.mean(axis=1, keepdims=True); R -= R.mean(axis=1, keepdims=True)
+        nums.append(np.sum(L * R, axis=1))
+        denoms.append(np.sqrt(np.sum(L * L, axis=1) * np.sum(R * R, axis=1)))
+    num = np.concatenate(nums)
+    denom = np.concatenate(denoms)
     valid = denom > 1e-12
     if not valid.any(): return "", ""
-    avg = float(np.mean(np.sum(L * R, axis=1)[valid] / denom[valid]))
+    avg = float(np.mean(num[valid] / denom[valid]))
     if avg >= 0.9: return f"{avg:.3f}", "Mono-compatible"
     elif avg >= 0.5: return f"{avg:.3f}", "Normal stereo"
     elif avg >= 0.0: return f"{avg:.3f}", "Wide stereo"
@@ -838,23 +871,49 @@ def measure_phase_correlation(mid: "np.ndarray | None", side: "np.ndarray | None
     else: return f"{avg:.3f}", "⚠ Phase cancellation — check mono fold-down"
 
 def detect_clipping(mid: "np.ndarray | None", side: "np.ndarray | None") -> tuple[str, str]:
-    """Counts samples at digital full scale (≥ 16-bit ceiling) across both channels."""
+    """Counts samples at digital full scale (≥ 16-bit ceiling) across both channels.
+
+    Evaluated in chunks so neither the L/R sums nor their absolute values are ever
+    materialized for the whole track (a pure counting reduction — chunk boundaries
+    cannot change the result)."""
     if not _NUMPY_OK or mid is None: return "", ""
     threshold = 1.0 - 1.0 / 32768
+    CHUNK = 1 << 20  # ~4 MB of float32 per temp
+
+    def _clipped(a: "np.ndarray", b: "np.ndarray | None", invert_b: bool = False) -> int:
+        total = 0
+        for s in range(0, len(a), CHUNK):
+            if b is None:
+                seg = np.abs(a[s : s + CHUNK])
+            else:
+                seg = (a[s : s + CHUNK] - b[s : s + CHUNK]) if invert_b else (a[s : s + CHUNK] + b[s : s + CHUNK])
+                np.abs(seg, out=seg)  # seg is the fresh sum/difference buffer — safe to modify
+            total += int(np.count_nonzero(seg >= threshold))
+        return total
+
     if side is not None:
-        total = int(np.sum(np.abs(mid + side) >= threshold) + np.sum(np.abs(mid - side) >= threshold))
+        total = _clipped(mid, side) + _clipped(mid, side, invert_b=True)  # L = mid+side, R = mid-side
     else:
-        total = int(np.sum(np.abs(mid) >= threshold))
+        total = _clipped(mid, None)
     if total == 0: return "0", "✓ No clipped samples"
     elif total < 10: return str(total), f"~ {total} clipped sample(s) — minor"
     else: return str(total), f"⚠ {total:,} clipped samples — audible distortion likely"
 
 def _noise_floor_from_audio(mid: "np.ndarray | None", sample_rate: int) -> str:
-    """Fallback noise floor: 5th percentile of per-100ms block RMS, in dBFS."""
+    """Fallback noise floor: 5th percentile of per-100ms block RMS, in dBFS.
+
+    Row-chunked like measure_phase_correlation — identical per-block statistics
+    without a full-track float64 copy plus its square."""
     if not _NUMPY_OK or mid is None or len(mid) < sample_rate: return ""
     block = sample_rate // 10
     n = len(mid) // block
-    rms = np.sqrt(np.mean(mid[: n * block].reshape(n, block).astype(np.float64) ** 2, axis=1))
+    rms = np.empty(n)
+    ROWS = 256
+    for start in range(0, n, ROWS):
+        cnt = min(ROWS, n - start)
+        segs = mid[start * block : (start + cnt) * block].reshape(cnt, block).astype(np.float64)
+        np.multiply(segs, segs, out=segs)
+        rms[start : start + cnt] = np.sqrt(segs.mean(axis=1))
     rms = rms[rms > 0]
     if rms.size < 5: return ""
     return f"{20 * math.log10(float(np.percentile(rms, 5))):.2f}"
@@ -862,7 +921,11 @@ def _noise_floor_from_audio(mid: "np.ndarray | None", sample_rate: int) -> str:
 def map_silence(mid: "np.ndarray | None", sample_rate: int, duration_sec: float) -> tuple[str, list[str]]:
     """Silent passages (< -60 dBFS for ≥ 0.5 s), vectorized run detection."""
     if not _NUMPY_OK or mid is None or len(mid) == 0: return "", []
-    is_sil = np.abs(mid) < 10 ** (-60.0 / 20.0)
+    threshold = 10 ** (-60.0 / 20.0)
+    is_sil = np.empty(len(mid), dtype=bool)
+    CHUNK = 1 << 20
+    for s in range(0, len(mid), CHUNK):
+        is_sil[s : s + CHUNK] = np.abs(mid[s : s + CHUNK]) < threshold
     padded = np.concatenate(([False], is_sil, [False]))
     d = np.diff(padded.astype(np.int8))
     starts_i, ends_i = np.where(d == 1)[0], np.where(d == -1)[0]
@@ -897,9 +960,10 @@ def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Optional[
     """Generates a clean mono spectrogram (SoX rendering — best visual quality).
 
     The decoded mono WAV is piped from ffmpeg straight into SoX's stdin: no temp
-    file, no disk I/O. Height is 513 px (a power of two + 1) — SoX maps that to
-    an efficient DFT size; 512 forces a pathological resampling path ~20x slower.
-    Falls back to ffmpeg showspectrumpic if SoX fails.
+    file, no disk I/O, and no full-track buffer held in this process. Height is
+    513 px (a power of two + 1) — SoX maps that to an efficient DFT size; 512
+    forces a pathological resampling path ~20x slower. Falls back to ffmpeg
+    showspectrumpic if SoX fails.
 
     ffmpeg can't seek back on the pipe to patch the WAV data-chunk size, so SoX
     reads a bogus length ("Premature EOF on .wav input file") and can't scale the
@@ -910,27 +974,22 @@ def generate_spectrogram(filepath: Path, duration_sec: float = 0.0) -> Optional[
     """
     output = filepath.with_name(f"{filepath.stem}_spectrogram.png")
 
-    decode = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(filepath), "-vn",
-         "-ac", "1", "-sample_fmt", "s16", "-f", "wav", "pipe:1"],
-        capture_output=True, check=False)
-
-    if decode.returncode == 0 and decode.stdout:
-        spectro = ["spectrogram"]
-        if duration_sec > 0:
-            spectro += ["-d", f"{duration_sec:.3f}"]   # see docstring: scales the time axis to -x
-        sox_result = subprocess.run(
-            ["sox", "-t", "wav", "-", "-n",
-             *spectro,
-             "-x", "1280",   # width in pixels
-             "-y", "513",    # height in pixels (2^n + 1 -> fast DFT path in SoX)
-             "-z", "120",    # dynamic range in dB
-             "-Z", "-20",    # clip ceiling at −20 dB (removes whitewash)
-             "-t", filepath.stem,
-             "-o", str(output)],
-            input=decode.stdout, capture_output=True, check=False)
-        if sox_result.returncode == 0 and output.exists():
-            return output
+    spectro = ["spectrogram"]
+    if duration_sec > 0:
+        spectro += ["-d", f"{duration_sec:.3f}"]   # see docstring: scales the time axis to -x
+    # "-n" is SoX's null output device: the image comes from the effect's own -o,
+    # and without it SoX refuses the command line ("Not enough input filenames").
+    result, decode_rc = _pipe_ffmpeg_to_sox(filepath, 1, [
+        "-n",
+        *spectro,
+        "-x", "1280",   # width in pixels
+        "-y", "513",    # height in pixels (2^n + 1 -> fast DFT path in SoX)
+        "-z", "120",    # dynamic range in dB
+        "-Z", "-20",    # clip ceiling at −20 dB (removes whitewash)
+        "-t", filepath.stem,
+        "-o", str(output)])
+    if decode_rc == 0 and result.returncode == 0 and output.exists():
+        return output
 
     _run([
         "ffmpeg", "-y", "-i", str(filepath), "-vn",
@@ -1068,7 +1127,13 @@ class SpectralEngine:
         raw = np.frombuffer(result.stdout, dtype=np.float32)
         if len(raw) < 2: return None
         interleaved = raw.reshape(-1, 2)
-        return (interleaved[:, 0] + interleaved[:, 1]) / 2.0, (interleaved[:, 0] - interleaved[:, 1]) / 2.0
+        # In-place halves: (L+R)/2 then (L-R)/2 reuse their sum/difference buffers
+        # instead of allocating a second full-track temp per channel.
+        mid = interleaved[:, 0] + interleaved[:, 1]
+        mid /= 2.0
+        side = interleaved[:, 0] - interleaved[:, 1]
+        side /= 2.0
+        return mid, side
 
     def _compute_frames(self, audio: "np.ndarray", hop: Optional[int] = None) -> "np.ndarray":
         return self._compute_stft(audio, hop=hop)[0]
@@ -1085,7 +1150,10 @@ class SpectralEngine:
         bin_hz = bins[1] - bins[0]
         hi_start = min(len(bins) - 1, int(10000 / bin_hz))
         idx = np.arange(self.WINDOW)
-        mags, phases = [], []
+        # Outputs sized exactly up front: chunk results are written in place, so the
+        # concatenated arrays never coexist with a second full copy of themselves.
+        mags = np.empty((n_frames, len(bins)), dtype=np.float32)
+        phases = np.empty((n_frames, len(bins) - hi_start), dtype=np.float32)
         CHUNK = 512
         for start in range(0, n_frames, CHUNK):
             cnt = min(CHUNK, n_frames - start)
@@ -1093,12 +1161,9 @@ class SpectralEngine:
             block = audio[offs[:, None] + idx[None, :]] * win
             # scipy's pocketfft releases the GIL and runs multithreaded
             spec = _srfft(block, axis=1, workers=-1) if _SCIPY_OK else np.fft.rfft(block, axis=1)
-            mags.append(np.abs(spec).astype(np.float32))
-            phases.append(np.angle(spec[:, hi_start:]).astype(np.float32))
-        if not mags:
-            empty = np.zeros((0, len(bins)), dtype=np.float32)
-            return empty, empty[:, hi_start:], hi_start
-        return np.concatenate(mags), np.concatenate(phases), hi_start
+            mags[start:start + cnt] = np.abs(spec)
+            phases[start:start + cnt] = np.angle(spec[:, hi_start:])
+        return mags, phases, hi_start
 
     def _freq_bins(self) -> "np.ndarray": return np.fft.rfftfreq(self.WINDOW, 1.0 / self.sample_rate)
 
@@ -1190,13 +1255,27 @@ class SpectralEngine:
         return peaks > ref * 1e-3  # -60 dB
 
     def _cutoff_per_frame(self, frames: "np.ndarray", bins: "np.ndarray") -> "np.ndarray":
+        """Last bin above the cutoff threshold, per frame.
+
+        Processed in row chunks: every frame's reduction is independent, so the
+        result is bit-identical to a whole-array pass while the intermediate
+        dB array never exceeds a small block (was 2x the full spectrum)."""
         if frames.shape[0] == 0: return np.zeros(0)
-        ref = frames.max(axis=1, keepdims=True) + 1e-12
-        db = 20.0 * np.log10(frames / ref + 1e-12)
-        mask = db > self.CUTOFF_DB
-        has_any = mask.any(axis=1)
-        last_idx = mask.shape[1] - 1 - np.argmax(mask[:, ::-1], axis=1)
-        return np.where(has_any, bins[last_idx], 0.0)
+        n_bins = frames.shape[1]
+        out = np.empty(frames.shape[0], dtype=np.float64)
+        ROWS = 256
+        for s in range(0, frames.shape[0], ROWS):
+            blk = frames[s : s + ROWS]
+            ref = blk.max(axis=1, keepdims=True) + 1e-12
+            db = blk / ref
+            db += 1e-12
+            np.log10(db, out=db)
+            db *= 20.0
+            mask = db > self.CUTOFF_DB
+            has_any = mask.any(axis=1)
+            last_idx = n_bins - 1 - np.argmax(mask[:, ::-1], axis=1)
+            out[s : s + blk.shape[0]] = np.where(has_any, bins[last_idx], 0.0)
+        return out
 
     def _sharpness(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float, window_hz: float = 2500.0) -> float:
         bin_hz = bins[1] - bins[0]
@@ -1238,7 +1317,12 @@ class SpectralEngine:
     def _noise_floor_above_cutoff(self, frames: "np.ndarray", bins: "np.ndarray", cutoff_hz: float) -> float:
         above = frames[:, int(cutoff_hz / (bins[1] - bins[0])):]
         if above.size == 0: return -120.0
-        return float(20.0 * np.log10(float(np.sqrt(np.mean(above ** 2))) + 1e-12))
+        # Squared in place on a private copy: the arithmetic chain is unchanged,
+        # but the [frames, HF bins] square temp is not allocated alongside its
+        # source. The copy keeps the source array's dtype, as the original did.
+        sq = np.array(above, copy=True)
+        np.multiply(sq, sq, out=sq)
+        return float(20.0 * np.log10(float(np.sqrt(np.mean(sq))) + 1e-12))
 
     def _side_channel_anomaly(self, mid_frames: "np.ndarray", side: "np.ndarray", bins: "np.ndarray") -> float:
         """Joint-stereo forensics on y_side = (L−R)/2 — codecs starve the side channel of HF first."""
@@ -1279,16 +1363,24 @@ class SpectralEngine:
         if frames.shape[0] > 2500:  # bound stats converge long before this — subsample
             frames = frames[:: frames.shape[0] // 2500 + 1]
         ref = frames.max(axis=1, keepdims=True) + 1e-12
-        db = 20.0 * np.log10(frames / ref + 1e-12)
-        db = np.maximum(db, -110.0)                                  # clamp: decoder numerical residue -> constant
+        # db = 20·log10(frames/ref + 1e-12), computed in place on the quotient buffer
+        # (values identical to the chained temporaries; ~4 full-spectrum copies saved).
+        db = frames / ref
+        db += 1e-12
+        np.log10(db, out=db)
+        db *= 20.0
+        np.maximum(db, -110.0, out=db)                   # clamp: decoder numerical residue -> constant
         # float32 running moments: values span [-25, 0] on this scale, so the m2-m1²
         # cancellation error (~1e-4) sits orders below the 0.6 scatter threshold.
-        log_power = ((db / 10.0) * np.log(10.0)).astype(np.float32)  # natural-log power scale
+        db /= 10.0
+        db *= np.log(10.0)                               # natural-log power scale
+        log_power = db if db.dtype == np.float32 else db.astype(np.float32)
 
         # 5-bin sliding std via running moments (O(n), GIL-free) + 5-bin smoothing —
         # replaces sliding_window_view().std() + median_filter at ~10x the speed.
         m1 = _uniform1d(log_power, 5, axis=1, mode="nearest")
-        m2 = _uniform1d(log_power * log_power, 5, axis=1, mode="nearest")
+        np.multiply(log_power, log_power, out=log_power)  # log_power consumed after this
+        m2 = _uniform1d(log_power, 5, axis=1, mode="nearest")
         scatter = np.sqrt(np.maximum(m2 - m1 * m1, 0.0))
         scatter = _uniform1d(scatter, 5, axis=1, mode="nearest")
 
@@ -1306,11 +1398,18 @@ class SpectralEngine:
         prob_bound = float((edges[mi] + edges[mi + 1]) / 2.0)
 
         # High-band (>=10 kHz) phase-difference entropy: lossy codecs randomize HF phase.
+        # The wrapped-phase difference is elementwise, so the 36-bin histogram is
+        # accumulated over row chunks — bin counts are identical to a single pass over
+        # the whole array, which used to materialize five full float64 copies.
         phase_entropy = 0.0
         if phase_hi.shape[0] >= 3 and phase_hi.shape[1] >= 2:
-            pd = np.diff(phase_hi.astype(np.float64), axis=0)
-            pdw = np.arctan2(np.sin(pd), np.cos(pd))
-            hist_p, _ = np.histogram(pdw, bins=36, range=(-np.pi, np.pi))
+            hist_p = np.zeros(36, dtype=np.int64)
+            ROWS = 512
+            n_ph = phase_hi.shape[0]
+            for s in range(0, n_ph - 1, ROWS):
+                pd = np.diff(phase_hi[s : s + ROWS + 1].astype(np.float64), axis=0)
+                pdw = np.arctan2(np.sin(pd), np.cos(pd))
+                hist_p += np.histogram(pdw, bins=36, range=(-np.pi, np.pi))[0]
             p = hist_p / (hist_p.sum() + 1e-12)
             p = p[p > 0]
             phase_entropy = float(-np.sum(p * np.log2(p)))
@@ -1421,7 +1520,9 @@ class SpectralEngine:
 
         Runs in float32 (FFT roundoff is O(eps·log N) ≈ −120 dB — far below the −85 dB
         void threshold) and caches the forward transform per signal length: the void,
-        cassette and vinyl rules all band-slice the same capped signal."""
+        cassette and vinyl rules all band-slice the same capped signal. Only the
+        spectrum is cached — the freq axis is recomputed per call (trivial) so the
+        cache holds no second full-length array."""
         n = len(x)
         if not _SCIPY_OK:
             X = np.fft.rfft(x.astype(np.float64))
@@ -1429,13 +1530,15 @@ class SpectralEngine:
             X[(f < lo) | (f > hi)] = 0.0
             return np.fft.irfft(X, n=n)
         key = (n, float(x[0]), float(x[n // 2]), float(x[-1]))
-        cached = self._rfft_cache.get(key)
-        if cached is None:
-            nf = _next_fast_len(n)
+        # The padded transform length is a pure function of n, so it is recomputed
+        # rather than cached alongside the spectrum (whose length is nf//2 + 1 and
+        # therefore cannot be inverted back to nf when nf is odd).
+        nf = _next_fast_len(n)
+        X = self._rfft_cache.get(key)
+        if X is None:
             X = _srfft(x.astype(np.float32, copy=False), n=nf, workers=-1)
-            f = _srfftfreq(nf, 1.0 / self.sample_rate)
-            cached = self._rfft_cache[key] = (X, f, nf)
-        X, f, nf = cached
+            self._rfft_cache[key] = X
+        f = _srfftfreq(nf, 1.0 / self.sample_rate)
         Y = np.where((f >= lo) & (f <= hi), X, np.complex64(0))
         return _sirfft(Y, n=nf, workers=-1)[:n]
 
@@ -1453,8 +1556,14 @@ class SpectralEngine:
 
         # --- Phase 1: silence dither ratio
         threshold_linear = 10 ** (-40.0 / 20.0)
-        is_sil = np.abs(audio) < threshold_linear
+        # Chunked so the full-track |audio| temporary is never materialized; the
+        # comparison is elementwise, so the mask is identical either way.
+        is_sil = np.empty(len(audio), dtype=bool)
+        CHUNK = 1 << 20
+        for s in range(0, len(audio), CHUNK):
+            is_sil[s : s + CHUNK] = np.abs(audio[s : s + CHUNK]) < threshold_linear
         padded = np.concatenate(([False], is_sil, [False]))
+        del is_sil
         d = np.diff(padded.astype(np.int8))
         starts, ends = np.where(d == 1)[0], np.where(d == -1)[0]
         min_samples = int(0.5 * sr)
@@ -1555,6 +1664,7 @@ class SpectralEngine:
         # 9A: Pre-echo — MDCT block smearing leaks HF energy *before* sharp transients
         env_smooth = self._smooth_envelope(cap, 0.001)
         peaks, _ = _sps.find_peaks(env_smooth, height=10 ** (-3.0 / 20.0), distance=int(0.05 * sr))
+        del env_smooth  # 180 s buffer — no longer needed once peak locations are known
         if len(peaks) > 0:
             hf = bandpass_filter(cap, 10000, min(20000, self.nyquist - 100), sr)
             baseline = float(np.median(hf ** 2))
@@ -1564,6 +1674,7 @@ class SpectralEngine:
                 if p < pre_w + post_w: continue
                 pre_energy = float(np.mean(hf[p - pre_w : p - post_w] ** 2))
                 if pre_energy > baseline * 3: affected += 1
+            del hf
             preecho_pct = (affected / len(peaks)) * 100
             if preecho_pct > 10:
                 score += 15
@@ -1587,6 +1698,7 @@ class SpectralEngine:
                 if va > 1e-12 and vb > 1e-12:
                     cov = float(np.dot(sa, sb)) / seg_len - ma * mb
                     corrs.append(abs(cov / math.sqrt(va * vb)))
+            del band_a, band_b_inv  # both 180 s buffers — aliasing verdict is decided
             aliasing_corr = float(np.median(corrs)) if corrs else 0.0
             if aliasing_corr > 0.5:
                 score += 15
@@ -1689,12 +1801,13 @@ class SpectralEngine:
         # Reconstruct L/R: Vorbis coupling is not ordinary M/S. Averaging L/R
         # fills quantized zeros and hides high-quality encodes from a mid test.
         for channel in (("L", "R") if side is not None else ("M",)):
+            # Upcast once, then fold the side channel in place — same elementwise
+            # arithmetic as `mid.astype(f64) ± side` without the extra full-length temp.
+            signal = mid.astype(np.float64)
             if channel == "L":
-                signal = mid.astype(np.float64) + side[:len(mid)]
+                signal += side[:len(signal)]
             elif channel == "R":
-                signal = mid.astype(np.float64) - side[:len(mid)]
-            else:
-                signal = mid.astype(np.float64)
+                signal -= side[:len(signal)]
             energies = np.array([np.mean(signal[p:p + size] ** 2) for p in positions])
             active = energies > max(1e-7, float(energies.max()) * 1e-6)
             curves = []
@@ -1760,30 +1873,37 @@ class SpectralEngine:
         lo = _ndtr(-mu / sigma)
         gam = mu + sigma * _ndtri(P + (1.0 - P) * lo)
 
-        # AAC quantizer/dead-zone constants assume ~16-bit integer PCM scale
+        # AAC quantizer/dead-zone constants assume ~16-bit integer PCM scale.
+        # Channels are upcast to float64 one at a time (a 180 s buffer each) and
+        # released before the next is converted.
         cap_n = int(self.TIME_DOMAIN_CAP_S * sr)
-        mid = np.ascontiguousarray(mid[:cap_n], dtype=np.float64) * 32768.0
-        if len(mid) < N2 * 4:
+        if len(mid[:cap_n]) < N2 * 4:
             return -1.0
         channels = [("M", mid)]
         if side is not None:
-            channels.append(("S", np.ascontiguousarray(side[:cap_n], dtype=np.float64) * 32768.0))
+            channels.append(("S", side))
 
         win = self._kbd_window(N2)
         n_anchors, n_sf, phase_step = 16, 8, 8
         phases = np.arange(0, N, phase_step)
 
         bestL = -1.0
-        for _name, sig in channels:
+        for _name, src in channels:
+            sig = np.ascontiguousarray(src[:cap_n], dtype=np.float64) * 32768.0
             # Each channel needs its own active anchors. A silent side channel
             # (dual mono) has exact zeros, which are not quantizer evidence.
             hop = N
             npos = (len(sig) - N2) // hop
             if npos < 2:
                 continue
-            csq = np.concatenate(([0.0], np.cumsum(sig * sig)))
+            # Cumulative energy with a 0 leading term written into the same buffer —
+            # identical values to concatenate(([0], cumsum(sig*sig))), one copy less.
+            csq = np.empty(len(sig) + 1, dtype=np.float64)
+            csq[0] = 0.0
+            np.cumsum(sig * sig, out=csq[1:])
             starts = np.arange(npos) * hop
             eblk = csq[starts + N2] - csq[starts]
+            del csq
             energy_floor = max(N2 * 100.0, float(eblk.max()) * 1e-6)
             anchors = []
             for idx in np.argsort(eblk)[::-1]:
@@ -1797,6 +1917,7 @@ class SpectralEngine:
                     anchors.append(pos)
                 if len(anchors) >= n_anchors:
                     break
+            del eblk
             # A single transient is insufficient evidence of a persistent grid.
             if len(anchors) < 4:
                 continue
@@ -1805,7 +1926,9 @@ class SpectralEngine:
                 base = a - N // 2
                 for pi, phi in enumerate(phases):
                     windows[ai * len(phases) + pi] = sig[base + phi : base + phi + N2]
+            del sig  # windows hold every sample the MDCT needs
             X = np.abs(self._mdct_batch(windows, win))
+            del windows
             band_power = np.add.reduceat(X * X, seg_starts, axis=1) / K
             energetic = band_power > np.maximum(
                 1.0, band_power.max(axis=1, keepdims=True) * 1e-6)
@@ -1813,14 +1936,17 @@ class SpectralEngine:
             sdz = 16.0 + (4.0 / 3.0) * np.log2(maxX)          # dead-zone scalefactor (Eq. 2)
             smin, smax = 0.3 * sdz, 0.7 * sdz                  # 90% of real AAC scalefactors
             Xp = X ** 0.75                                      # AAC ^0.75 power-law quantizer
+            del X
             c_sf_phase = np.zeros((n_sf, len(phases)))
             for i_sf in range(n_sf):
                 frac = i_sf / (n_sf - 1) if n_sf > 1 else 0.0
                 s_band = smin + frac * (smax - smin)
                 scale_bins = np.repeat(2.0 ** (-3.0 * s_band / 16.0), counts, axis=1)
                 xsc = Xp * scale_bins
-                eps = np.round(xsc) - xsc
-                E = np.add.reduceat(eps * eps, seg_starts, axis=1)
+                eps = np.round(xsc)
+                eps -= xsc
+                np.multiply(eps, eps, out=eps)
+                E = np.add.reduceat(eps, seg_starts, axis=1)
                 # Near-zero coefficients round to zero in any signal, including
                 # pure tones and quiet bands. Only populated, energetic bands
                 # can support the quantization-error hypothesis.
@@ -1830,6 +1956,7 @@ class SpectralEngine:
                 c = ((E < gam[None, :]) & eligible).mean(axis=1)
                 c = np.where(supported, c, 0.0)
                 c_sf_phase[i_sf] = c.reshape(len(anchors), len(phases)).mean(axis=0)
+            del Xp
             bestL = max(bestL, float(c_sf_phase.max()))
         return bestL
 
@@ -1909,8 +2036,13 @@ class SpectralEngine:
         if cutoff_idx < 10 or frames.shape[0] == 0: return 0.0
         region = frames[:, :cutoff_idx]
         ref = frames.max(axis=1, keepdims=True) + 1e-12
-        db = 20.0 * np.log10(region / ref + 1e-12)
-        return float(np.sum(db < -95.0) / (db.size + 1e-12))
+        # In-place dB chain on the quotient buffer — same values, one array instead
+        # of the quotient plus the log10 result.
+        db = region / ref
+        db += 1e-12
+        np.log10(db, out=db)
+        db *= 20.0
+        return float(np.count_nonzero(db < -95.0) / (db.size + 1e-12))
 
     def _ultrasonic_envelope_correlation(self, frames: "np.ndarray", bins: "np.ndarray") -> float:
         """Pearson correlation between the mid-band (1-8 kHz) and high-band (16-22 kHz)
@@ -1921,8 +2053,12 @@ class SpectralEngine:
         m_lo, m_hi = int(1000 / bin_hz), int(8000 / bin_hz)
         h_lo, h_hi = int(16000 / bin_hz), min(frames.shape[1], int(22000 / bin_hz))
         if h_hi <= h_lo or m_hi <= m_lo: return 1.0
-        env_mid = np.sqrt(np.mean(frames[:, m_lo:m_hi].astype(np.float64) ** 2, axis=1))
-        env_high = np.sqrt(np.mean(frames[:, h_lo:h_hi].astype(np.float64) ** 2, axis=1))
+        env_mid = frames[:, m_lo:m_hi].astype(np.float64)
+        env_high = frames[:, h_lo:h_hi].astype(np.float64)
+        np.multiply(env_mid, env_mid, out=env_mid)
+        np.multiply(env_high, env_high, out=env_high)
+        env_mid = np.sqrt(env_mid.mean(axis=1))
+        env_high = np.sqrt(env_high.mean(axis=1))
         std_mid, std_high = float(np.std(env_mid)), float(np.std(env_high))
         if std_mid < 1e-8 or std_high < 1e-8: return 0.0
         corr = float(np.mean((env_mid - env_mid.mean()) * (env_high - env_high.mean())) / (std_mid * std_high))
@@ -2181,12 +2317,16 @@ class SpectralEngine:
 
         # Silent frames carry no spectral evidence — exclude them from all statistics
         active = self._active_frame_mask(frames_all)
-        if int(active.sum()) >= 4:
-            frames, phase_act = frames_all[active], phase_hi[active]
-        else:
+        if int(active.sum()) < 4:
             result.primary_verdict = "Insufficient active audio for spectral analysis"
             result.verdict_label = "INCONCLUSIVE"
             return result
+        # Joint-stereo forensics runs on the UNMASKED frames (its 4x stride subsamples
+        # anyway), so the full-size magnitude and phase arrays — the largest buffers in
+        # the analysis — can be released as soon as the active subset is extracted.
+        side_anomaly = self._side_channel_anomaly(frames_all, side, bins) if side is not None else 0.0
+        frames, phase_act = frames_all[active], phase_hi[active]
+        del frames_all, phase_hi, active
 
         st("spectral metrics")
         cutoffs_per_frame = self._cutoff_per_frame(frames, bins)
@@ -2197,10 +2337,6 @@ class SpectralEngine:
         banding, nf_above = self._banding_score(frames, bins, cutoff_hz), self._noise_floor_above_cutoff(frames, bins, cutoff_hz)
         lpf_detected, lpf_s = self._lpf_scan(frames, bins)
         entropy, dsd_detected = self._spectral_entropy(frames), self._dsd_scan(frames, bins)
-
-        side_anomaly = 0.0
-        if side is not None:
-            side_anomaly = self._side_channel_anomaly(frames_all, side, bins)
 
         lossy_score, lossy_ev, natural_score, natural_ev = self._score(cutoff_hz, cutoff_var, sharpness, cliff_depth, hf_ratio, nf_above, banding, side_anomaly, entropy, dsd_detected)
         net_score = max(0, lossy_score - natural_score)
