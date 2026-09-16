@@ -18,10 +18,17 @@ import time
 
 
 class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    """Exactly the Windows PROCESS_MEMORY_COUNTERS_EX layout — every field in order.
+
+    Getting this wrong is silent: the API fills what fits and the fields after an
+    omission are read from the wrong offset (an earlier version of this file dropped
+    WorkingSetSize, so "private" was really reading PagefileUsage).
+    """
     _fields_ = [
         ("cb", wt.DWORD),
         ("PageFaultCount", wt.DWORD),
         ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
         ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
         ("QuotaPagedPoolUsage", ctypes.c_size_t),
         ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
@@ -51,8 +58,8 @@ def sample(pid: int) -> tuple[int, int] | None:
         pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
         if not psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
             return None
-        # Working set ≈ resident RAM; PrivateUsage = commit charge, matching
-        # MEMORY_REPORT.md's "private memory".
+        # Working set ≈ resident RAM (the figure a container limit enforces);
+        # PrivateUsage = commit charge ("private memory" in MEMORY_REPORT.md).
         return pmc.PeakWorkingSetSize, pmc.PrivateUsage
     finally:
         kernel32.CloseHandle(h)
