@@ -99,6 +99,18 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", check=False)
 
+def _extractor_workers() -> int:
+    """Concurrency for the per-track extractor jobs (loudness, sox stats, spectrogram,
+    bit depth). Each runs a child ffmpeg/sox process, and on a memory-capped container
+    those children compete with the engine for the same budget; AF_EXTRACTORS=1 or 2
+    serialises them on a small host at the cost of wall time."""
+    try:
+        return max(1, int(os.getenv("AF_EXTRACTORS", "4")))
+    except ValueError:
+        return 4
+
+_EXTRACTOR_WORKERS = _extractor_workers()
+
 def _pipe_ffmpeg_to_sox(filepath: Path, channels: int,
                         sox_args: list[str]) -> tuple[subprocess.CompletedProcess, int]:
     """Decode with ffmpeg and stream the WAV straight into SoX's stdin.
@@ -1108,32 +1120,99 @@ class SpectralEngine:
         # same capped signal; the forward transform is the expensive half.
         self._rfft_cache: "dict[int, tuple] " = {}
 
-    def _decode_audio(self, max_seconds: Optional[float] = None) -> "np.ndarray | None":
-        if not _NUMPY_OK: return None
+    def _frame_hint(self, max_seconds: Optional[float]) -> int:
+        """Starting size for a decode buffer, from the container duration.
+
+        Only a hint: the read loops grow geometrically if the stream turns out longer,
+        which is the forged/truncated-header case the duration check exists to catch — a
+        short header must never truncate what actually decodes.
+        """
+        secs = max_seconds if max_seconds else self.claimed_duration
+        if not secs or secs <= 0:
+            return 0
+        return int(secs * self.sample_rate) + self.sample_rate  # +1 s of rounding slack
+
+    def _pcm_cmd(self, max_seconds: Optional[float], channels: int) -> list[str]:
         cmd = ["ffmpeg", "-i", str(self.filepath), "-vn"]
         if max_seconds: cmd += ["-t", str(max_seconds)]
-        cmd += ["-ac", "1", "-ar", str(self.sample_rate), "-f", "f32le", "pipe:1"]
-        result = subprocess.run(cmd, capture_output=True, check=False)
-        if result.returncode != 0 or not result.stdout: return None
-        return np.frombuffer(result.stdout, dtype=np.float32)
+        cmd += ["-ac", str(channels), "-ar", str(self.sample_rate), "-f", "f32le", "pipe:1"]
+        return cmd
+
+    def _decode_audio(self, max_seconds: Optional[float] = None) -> "np.ndarray | None":
+        """Mono decode, streamed straight into the destination array.
+
+        `subprocess.run(capture_output=True)` materialises the whole decoded stream as a
+        bytes object and the caller copies out of it afterwards, so the decode peaked at
+        roughly twice the audio it produced. Reading the pipe into the destination keeps
+        it at the audio size plus one read window.
+        """
+        if not _NUMPY_OK: return None
+        out = np.empty(max(self._frame_hint(max_seconds), 1 << 16), dtype=np.float32)
+        filled, carry = 0, b""
+        proc = subprocess.Popen(self._pcm_cmd(max_seconds, 1),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                chunk = proc.stdout.read(1 << 20)
+                if not chunk: break
+                if carry: chunk = carry + chunk
+                usable = len(chunk) // 4 * 4          # whole float32 samples only
+                carry = chunk[usable:]
+                if not usable: continue
+                view = np.frombuffer(chunk[:usable], dtype=np.float32)
+                end = filled + len(view)
+                if end > len(out):
+                    grown = np.empty(max(end, len(out) * 2), dtype=np.float32)
+                    grown[:filled] = out[:filled]
+                    out = grown
+                out[filled:end] = view
+                filled = end
+        finally:
+            proc.stdout.close()
+            proc.wait()
+        if proc.returncode != 0 or filled == 0: return None
+        # A view into an over-sized buffer is only worth keeping when the slack is small
+        # (an over-reported duration); otherwise hand back a right-sized copy.
+        return out[:filled] if filled >= len(out) * 0.9 else out[:filled].copy()
 
     def _decode_stereo(self, max_seconds: Optional[float] = None) -> "tuple[np.ndarray, np.ndarray] | None":
+        """Stereo decode to (mid, side), folded as the pipe delivers PCM.
+
+        The interleaved stream never exists as one buffer: each read is reduced to
+        mid/side immediately, with the same per-element arithmetic as deriving the two
+        channels from a complete decode, so the samples are bit-identical.
+        """
         if not _NUMPY_OK: return None
-        cmd = ["ffmpeg", "-i", str(self.filepath), "-vn"]
-        if max_seconds: cmd += ["-t", str(max_seconds)]
-        cmd += ["-ac", "2", "-ar", str(self.sample_rate), "-f", "f32le", "pipe:1"]
-        result = subprocess.run(cmd, capture_output=True, check=False)
-        if result.returncode != 0 or not result.stdout: return None
-        raw = np.frombuffer(result.stdout, dtype=np.float32)
-        if len(raw) < 2: return None
-        interleaved = raw.reshape(-1, 2)
-        # In-place halves: (L+R)/2 then (L-R)/2 reuse their sum/difference buffers
-        # instead of allocating a second full-track temp per channel.
-        mid = interleaved[:, 0] + interleaved[:, 1]
-        mid /= 2.0
-        side = interleaved[:, 0] - interleaved[:, 1]
-        side /= 2.0
-        return mid, side
+        cap = max(self._frame_hint(max_seconds), 1 << 16)
+        mid = np.empty(cap, dtype=np.float32)
+        side = np.empty(cap, dtype=np.float32)
+        filled, carry = 0, b""
+        proc = subprocess.Popen(self._pcm_cmd(max_seconds, 2),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                chunk = proc.stdout.read(1 << 20)
+                if not chunk: break
+                if carry: chunk = carry + chunk
+                usable = len(chunk) // 8 * 8          # whole stereo frames only
+                carry = chunk[usable:]
+                if not usable: continue
+                view = np.frombuffer(chunk[:usable], dtype=np.float32).reshape(-1, 2)
+                end = filled + len(view)
+                if end > len(mid):
+                    grown = np.empty(max(end, len(mid) * 2), dtype=np.float32)
+                    grown[:filled] = mid[:filled]; mid = grown
+                    grown = np.empty_like(mid);     grown[:filled] = side[:filled]; side = grown
+                np.add(view[:, 0], view[:, 1], out=mid[filled:end]); mid[filled:end] /= 2.0
+                np.subtract(view[:, 0], view[:, 1], out=side[filled:end]); side[filled:end] /= 2.0
+                filled = end
+        finally:
+            proc.stdout.close()
+            proc.wait()
+        if proc.returncode != 0 or filled < 2: return None
+        if filled >= len(mid) * 0.9:
+            return mid[:filled], side[:filled]
+        return mid[:filled].copy(), side[:filled].copy()
 
     def _compute_frames(self, audio: "np.ndarray", hop: Optional[int] = None) -> "np.ndarray":
         return self._compute_stft(audio, hop=hop)[0]
@@ -1253,6 +1332,27 @@ class SpectralEngine:
         peaks = frames.max(axis=1)
         ref = peaks.max() + 1e-12
         return peaks > ref * 1e-3  # -60 dB
+
+    @staticmethod
+    def _compact_rows(arr: "np.ndarray", idx: "np.ndarray", sparse_frac: float = 0.7) -> "np.ndarray":
+        """Keep the rows named by `idx` (ascending) at the front of `arr`, in place.
+
+        Dropping silent frames with `arr[mask]` allocates a second array the size of the
+        spectrum at the exact moment it is largest. `idx` is strictly increasing, so row j
+        is always read from a position >= j: copying forward can never clobber a row that
+        has not been read yet, and the gather temporary stays chunk-sized. Returning a view
+        keeps the original buffer in play only (no duplicate); when very few rows survive,
+        a real copy is smaller than that buffer, so take the copy and let the buffer go.
+        """
+        k = len(idx)
+        if k == arr.shape[0]:
+            return arr
+        CHUNK = 512
+        for start in range(0, k, CHUNK):
+            rows = idx[start : start + CHUNK]
+            arr[start : start + len(rows)] = arr[rows]  # RHS gathered to a temp first
+        view = arr[:k]
+        return view if k >= sparse_frac * arr.shape[0] else view.copy()
 
     def _cutoff_per_frame(self, frames: "np.ndarray", bins: "np.ndarray") -> "np.ndarray":
         """Last bin above the cutoff threshold, per frame.
@@ -1639,7 +1739,9 @@ class SpectralEngine:
                     # --- Phase 3: clicks & pops
                     hp = highpass_filter(cap, 1000, sr)
                     env_smooth = self._smooth_envelope(hp, 0.0005)
+                    del hp  # filtered signal is no longer needed once the envelope exists
                     peaks, _ = _sps.find_peaks(env_smooth, height=float(np.median(env_smooth)) * 3, distance=int(0.01 * sr))
+                    del env_smooth
                     clicks_per_min = (len(peaks) / (len(cap) / sr)) * 60
                     if 5 <= clicks_per_min <= 50:
                         score -= 10
@@ -1801,22 +1903,31 @@ class SpectralEngine:
         # Reconstruct L/R: Vorbis coupling is not ordinary M/S. Averaging L/R
         # fills quantized zeros and hides high-quality encodes from a mid test.
         for channel in (("L", "R") if side is not None else ("M",)):
-            # Upcast once, then fold the side channel in place — same elementwise
-            # arithmetic as `mid.astype(f64) ± side` without the extra full-length temp.
-            signal = mid.astype(np.float64)
-            if channel == "L":
-                signal += side[:len(signal)]
-            elif channel == "R":
-                signal -= side[:len(signal)]
-            energies = np.array([np.mean(signal[p:p + size] ** 2) for p in positions])
+            def segment(start: int, count: int) -> "np.ndarray":
+                """L (or R) for [start, start+count) as float64, built on demand.
+
+                Same elementwise arithmetic as reconstructing the whole channel —
+                widen to float64, then fold the side channel in — but only the
+                requested window exists at a time. The full-length version was a
+                180 s float64 array (~64 MB) held across the entire search.
+                """
+                seg = mid[start : start + count].astype(np.float64)
+                if channel == "L":
+                    seg += side[start : start + count]
+                elif channel == "R":
+                    seg -= side[start : start + count]
+                return seg
+
+            energies = np.array([np.mean(segment(p, size) ** 2) for p in positions])
             active = energies > max(1e-7, float(energies.max()) * 1e-6)
             curves = []
+            span = hop + size  # widest offset the phase search below reaches
             for pos in positions[active]:
                 curve = np.empty(hop)
                 # Bound scratch space: 128 phases, not a full-track transform.
                 for first in range(0, hop, 128):
                     phases = np.arange(first, first + 128)
-                    block = signal[pos + phases[:, None] + np.arange(size)]
+                    block = segment(pos, span)[phases[:, None] + np.arange(size)]
                     coeff = np.abs(self._mdct_batch(block, window))[:, lo:hi]
                     threshold = np.maximum(coeff.max(axis=1, keepdims=True) * 1e-5, 1e-8)
                     curve[first:first + 128] = (coeff < threshold).mean(axis=1)
@@ -1889,18 +2000,28 @@ class SpectralEngine:
 
         bestL = -1.0
         for _name, src in channels:
-            sig = np.ascontiguousarray(src[:cap_n], dtype=np.float64) * 32768.0
+            # Widen and scale in place — one float64 buffer, not a converted copy plus
+            # its product. The window gather below reads `src` (float32) directly and
+            # converts per row, which is the same arithmetic per element, so the raw
+            # samples never have to coexist with their own square.
+            sig = np.ascontiguousarray(src[:cap_n], dtype=np.float64)
+            sig *= 32768.0
+            n_sig = len(sig)
             # Each channel needs its own active anchors. A silent side channel
             # (dual mono) has exact zeros, which are not quantizer evidence.
             hop = N
-            npos = (len(sig) - N2) // hop
+            npos = (n_sig - N2) // hop
             if npos < 2:
                 continue
             # Cumulative energy with a 0 leading term written into the same buffer —
             # identical values to concatenate(([0], cumsum(sig*sig))), one copy less.
-            csq = np.empty(len(sig) + 1, dtype=np.float64)
+            # Squaring in place is exact per element, so the summed values and their
+            # order are unchanged.
+            csq = np.empty(n_sig + 1, dtype=np.float64)
             csq[0] = 0.0
-            np.cumsum(sig * sig, out=csq[1:])
+            np.multiply(sig, sig, out=sig)
+            np.cumsum(sig, out=csq[1:])
+            del sig  # the window gather needs only the float32 source below
             starts = np.arange(npos) * hop
             eblk = csq[starts + N2] - csq[starts]
             del csq
@@ -1911,7 +2032,7 @@ class SpectralEngine:
                     break
                 pos = int(idx) * hop
                 base = pos - N // 2
-                if base < 0 or base + (N - 1) + N2 > len(sig):
+                if base < 0 or base + (N - 1) + N2 > n_sig:
                     continue
                 if all(abs(pos - p) > N2 for p in anchors):
                     anchors.append(pos)
@@ -1925,8 +2046,7 @@ class SpectralEngine:
             for ai, a in enumerate(anchors):
                 base = a - N // 2
                 for pi, phi in enumerate(phases):
-                    windows[ai * len(phases) + pi] = sig[base + phi : base + phi + N2]
-            del sig  # windows hold every sample the MDCT needs
+                    windows[ai * len(phases) + pi] = src[base + phi : base + phi + N2].astype(np.float64) * 32768.0
             X = np.abs(self._mdct_batch(windows, win))
             del windows
             band_power = np.add.reduceat(X * X, seg_starts, axis=1) / K
@@ -2323,10 +2443,11 @@ class SpectralEngine:
             return result
         # Joint-stereo forensics runs on the UNMASKED frames (its 4x stride subsamples
         # anyway), so the full-size magnitude and phase arrays — the largest buffers in
-        # the analysis — can be released as soon as the active subset is extracted.
+        # the analysis — can be compacted and the originals released here.
         side_anomaly = self._side_channel_anomaly(frames_all, side, bins) if side is not None else 0.0
-        frames, phase_act = frames_all[active], phase_hi[active]
-        del frames_all, phase_hi, active
+        keep = np.flatnonzero(active)
+        frames, phase_act = self._compact_rows(frames_all, keep), self._compact_rows(phase_hi, keep)
+        del frames_all, phase_hi, active, keep
 
         st("spectral metrics")
         cutoffs_per_frame = self._cutoff_per_frame(frames, bins)
@@ -2532,6 +2653,10 @@ class SpectralEngine:
             # Rule: auCDtect statistical bound frequency & high-band phase entropy
             st("auCDtect statistics")
             auc_avg, auc_prob, auc_phase = self._aucdtect_features(frames, phase_act, bins)
+            # Last consumer of the high-band phase array: everything below works from
+            # the magnitudes alone. Releasing it here keeps ~38 MB (7-min track) out of
+            # the MDCT/Vorbis phase below, which is where the analysis peaks.
+            del phase_act
             result.auc_avg_bound_freq, result.auc_prob_bound_freq, result.auc_phase_entropy = auc_avg, auc_prob, auc_phase
             if self.sample_rate >= 40000 and 0 < auc_avg < 16500 and not cassette_detected and not vinyl_detected:
                 main += 25
@@ -2554,6 +2679,11 @@ class SpectralEngine:
 
             # Rule: ultrasonic envelope correlation (anti-forensic noise-injection exposure)
             ultra = self._ultrasonic_envelope_correlation(frames, bins)
+            # Last consumer of the STFT magnitudes — the MDCT and Vorbis rules below
+            # are time-domain and read the decoded audio only. Dropping the spectrum
+            # here (76 MB on a 7-min track) is what keeps the peak in the spectral
+            # phase instead of stacking it on top of the MDCT scratch buffers.
+            del frames
             result.hf_envelope_correlation = ultra
             if ultra < 0.15 and 0 < auc_avg < cutoff_hz - 2000 and cutoff_hz > 16500:
                 main += 15
@@ -2660,7 +2790,11 @@ def build_report(filepath: Path, fast_secs: Optional[float] = None) -> ForensicR
 
     # Subprocess-bound extractors run concurrently while the DSP engine crunches
     # on the main thread (numpy/scipy release the GIL for the heavy operations).
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # Each one is a live ffmpeg/sox child, and children count against a container's
+    # memory limit just as this process does — the spectrogram chain (ffmpeg | sox) is
+    # the heaviest. AF_EXTRACTORS lowers the fan-out on memory-tight hosts; the default
+    # keeps the original behaviour.
+    with ThreadPoolExecutor(max_workers=_EXTRACTOR_WORKERS) as pool:
         f_loud = pool.submit(extract_loudness, filepath)
         f_sox = pool.submit(extract_sox_stats, filepath)
         f_spec = pool.submit(generate_spectrogram, filepath, tech.duration_sec)
